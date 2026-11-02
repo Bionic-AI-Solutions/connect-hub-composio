@@ -18,6 +18,7 @@ import type { ConnectionService } from '../auth/connections.js';
 import type { ExecutionContext, TriggerDef, TriggerRuntime, WebhookPayload } from '../catalog/types.js';
 import { ToolInputError } from '../catalog/types.js';
 import { AppError, badRequest, notFound } from '../errors.js';
+import type { UsageService } from '../tenancy/usage.js';
 import { assertPublicWebhookUrl, assertResolvesPublic } from '../net/url-guard.js';
 
 interface SubscriptionRow {
@@ -93,6 +94,7 @@ export class TriggerService {
     private readonly registry: Registry,
     private readonly connections: ConnectionService,
     private readonly config: Config,
+    private readonly usage?: UsageService,
     private readonly log: (msg: string, extra?: Record<string, unknown>) => void = () => undefined,
   ) {}
 
@@ -317,6 +319,7 @@ export class TriggerService {
         [newId('evt'), row.id, row.tenant_id, this.vault.encrypt(data, row.tenant_id)],
       );
     }
+    await this.usage?.recordTriggerEvents(row.tenant_id, items.length);
   }
 
   // ───────────────────────────── inbound webhooks ─────────────────────────────

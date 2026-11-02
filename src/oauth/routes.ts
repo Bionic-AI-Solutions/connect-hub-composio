@@ -80,14 +80,17 @@ export async function registerOAuthRoutes(app: FastifyInstance, s: Services) {
         const server = await s.mcp.getServer(r.serverId);
         return securePage(
           reply,
-          consentPage({
-            clientName: r.clientName,
-            redirectHost: r.redirectHost,
-            email: r.email,
-            serverName: server?.name ?? 'Connect Hub',
-            requestId: r.requestId,
-            consentToken: r.consentToken,
-          }),
+          consentPage(
+            {
+              clientName: r.clientName,
+              redirectHost: r.redirectHost,
+              email: r.email,
+              serverName: server?.name ?? 'Connect Hub',
+              requestId: r.requestId,
+              consentToken: r.consentToken,
+            },
+            await s.usage.branding(r.tenantId),
+          ),
         );
       } catch (e) {
         if (e instanceof AppError)

@@ -111,6 +111,8 @@ describe('triggers', () => {
       })
     ).json();
     expect(events.items).toHaveLength(4);
+    const usage = (await ctx.app.inject({ method: 'GET', url: '/v1/usage', headers: ctx.auth })).json();
+    expect(usage.trigger_events).toBe(4);
   });
 
   it('receives provider webhooks on a secret URL, answers handshakes, and unregisters on delete', async () => {

@@ -7,6 +7,7 @@ import type { Db } from '../db/index.js';
 import { Vault, constantTimeEqual } from '../crypto/vault.js';
 import { Registry } from '../catalog/registry.js';
 import { TenantService } from '../tenancy/tenants.js';
+import { UsageService, type Branding } from '../tenancy/usage.js';
 import { ConnectionService } from '../auth/connections.js';
 import { Executor } from '../execute/executor.js';
 import { McpService, type McpBinding } from '../mcp/gateway.js';
@@ -37,6 +38,7 @@ export interface Services {
   mcp: McpService;
   triggers: TriggerService;
   oauth: McpOAuthServer;
+  usage: UsageService;
 }
 
 export function createServices(config: Config, db: Db, registry: Registry): Services {
@@ -44,11 +46,12 @@ export function createServices(config: Config, db: Db, registry: Registry): Serv
   const vault = new Vault(config.MASTER_KEYS);
   const tenants = new TenantService(db);
   const connections = new ConnectionService(db, vault, registry, config);
-  const executor = new Executor(db, registry, connections, config);
+  const usage = new UsageService(db);
+  const executor = new Executor(db, registry, connections, config, usage);
   const mcp = new McpService(db, registry, executor, connections, config.PUBLIC_URL);
-  const triggers = new TriggerService(db, vault, registry, connections, config);
+  const triggers = new TriggerService(db, vault, registry, connections, config, usage);
   const oauth = new McpOAuthServer(db, vault, config, new OidcClient(config));
-  return { config, db, vault, registry, tenants, connections, executor, mcp, triggers, oauth };
+  return { config, db, vault, registry, tenants, connections, executor, mcp, triggers, oauth, usage };
 }
 
 function bearerToken(req: FastifyRequest): string | undefined {
@@ -146,6 +149,35 @@ export async function buildApp(
       return reply.status(201).send({ tenant, api_key: apiKey });
     });
     admin.get('/admin/tenants', async () => ({ items: await s.tenants.list() }));
+    admin.put<{ Params: { id: string }; Body: any }>('/admin/tenants/:id/limits', async (req) => {
+      if (!(await s.tenants.get(req.params.id))) throw new AppError(404, 'not_found', 'Tenant not found');
+      return s.usage.setLimits(req.params.id, req.body ?? {});
+    });
+    admin.get<{ Querystring: { period?: string; format?: string } }>('/admin/usage', async (req, reply) => {
+      const report = await s.usage.allTenants(req.query.period);
+      if (req.query.format !== 'csv') return report;
+      const cols = [
+        'tenant_id',
+        'name',
+        'tool_calls',
+        'failed_calls',
+        'trigger_events',
+        'monthly_tool_call_limit',
+        'rate_limit_per_minute',
+      ] as const;
+      const cell = (v: unknown) => {
+        const t = v === null || v === undefined ? '' : String(v);
+        // Quote, and defuse spreadsheet formulas in tenant-controlled names.
+        return `"${(/^[=+\-@]/.test(t) ? `'${t}` : t).replace(/"/g, '""')}"`;
+      };
+      const csv = [cols.join(','), ...report.items.map((r) => cols.map((c) => cell(r[c])).join(','))].join(
+        '\n',
+      );
+      return reply
+        .header('content-type', 'text/csv; charset=utf-8')
+        .header('content-disposition', `attachment; filename="usage-${report.period}.csv"`)
+        .send(csv + '\n');
+    });
     admin.put<{ Params: { id: string }; Body: any }>('/admin/tenants/:id/sso', async (req) => {
       if (!(await s.tenants.get(req.params.id))) throw new AppError(404, 'not_found', 'Tenant not found');
       return s.oauth.setSsoPolicy(req.params.id, req.body ?? {});
@@ -316,6 +348,13 @@ export async function buildApp(
 
     registerTriggerApi(v1, s.triggers);
     registerOAuthTenantApi(v1, s.oauth);
+    v1.get<{ Querystring: { period?: string } }>('/v1/usage', async (req) =>
+      s.usage.report(req.tenantId!, req.query.period),
+    );
+    v1.get('/v1/settings/branding', async (req) => s.usage.branding(req.tenantId!));
+    v1.put<{ Body: any }>('/v1/settings/branding', async (req) =>
+      s.usage.setBranding(req.tenantId!, (req.body ?? {}) as Record<string, unknown>),
+    );
 
     // Audit
     v1.get<{ Querystring: { user_id?: string; limit?: string } }>('/v1/audit-logs', async (req) => {
@@ -359,14 +398,19 @@ export async function buildApp(
     title: string,
     msg: string,
     isError = false,
+    branding: Branding = {},
   ) =>
     redirectUrl
       ? reply.redirect(withStatus(redirectUrl, params))
-      : html(reply, messagePage(title, msg, isError), isError ? 400 : 200);
+      : html(reply, messagePage(title, msg, isError, branding), isError ? 400 : 200);
 
   app.get<{ Params: { id: string }; Querystring: { sig?: string } }>('/connect/:id', async (req, reply) => {
     try {
-      const { toolkit, scheme } = await s.connections.openConnectRequest(req.params.id, req.query.sig ?? '');
+      const {
+        toolkit,
+        scheme,
+        req: cr,
+      } = await s.connections.openConnectRequest(req.params.id, req.query.sig ?? '');
       if (scheme.type === 'OAUTH2' && !scheme.fields.length) {
         return reply.redirect(await s.connections.authorizeUrl(req.params.id, req.query.sig ?? ''));
       }
@@ -376,6 +420,8 @@ export async function buildApp(
           toolkit,
           scheme,
           `/connect/${req.params.id}?sig=${encodeURIComponent(req.query.sig ?? '')}`,
+          undefined,
+          await s.usage.branding(cr.tenant_id),
         ),
       );
     } catch (e) {
@@ -407,6 +453,8 @@ export async function buildApp(
           { status: 'success', connected_account_id: account.id },
           'Connected',
           `${ctx.toolkit.name} is connected. You can close this window.`,
+          false,
+          await s.usage.branding(ctx.req.tenant_id),
         );
       } catch (e) {
         if (e instanceof AppError && e.statusCode < 500) {
@@ -417,6 +465,7 @@ export async function buildApp(
               ctx.scheme,
               `/connect/${req.params.id}?sig=${encodeURIComponent(sig)}`,
               e.message,
+              await s.usage.branding(ctx.req.tenant_id),
             ),
             400,
           );
@@ -449,6 +498,8 @@ export async function buildApp(
           { status: 'success', connected_account_id: account.id },
           'Connected',
           'Your account is connected. You can close this window.',
+          false,
+          await s.usage.branding(account.tenant_id),
         );
       } catch (e) {
         if (e instanceof AppError)
