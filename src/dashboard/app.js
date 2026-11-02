@@ -164,18 +164,20 @@ const parseList = (s) =>
     .map((x) => x.trim())
     .filter(Boolean);
 
+// Who "Connect" stores accounts for. Kept per tab (like the API key) and cleared on sign-out, so a shared browser
+// never pre-fills someone else's identity.
 const ME = 'connect-hub.me';
 function getMe() {
   try {
-    return localStorage.getItem(ME) || '';
+    return sessionStorage.getItem(ME) || '';
   } catch {
     return '';
   }
 }
 function setMe(v) {
   try {
-    if (v) localStorage.setItem(ME, v);
-    else localStorage.removeItem(ME);
+    if (v) sessionStorage.setItem(ME, v);
+    else sessionStorage.removeItem(ME);
   } catch {
     /* Storage may be blocked; the field just will not be remembered. */
   }
@@ -334,6 +336,8 @@ const views = {
       api('GET', '/v1/oauth-providers'),
     ]);
     const byProvider = new Map(providers.map((p) => [p.provider, p]));
+    // Counts are for the person connecting; without one, show no one's.
+    if (!me) for (const app of items) app.accounts = { active: 0, needs_attention: 0 };
     const panel = el('div');
     const grid = el('div', { class: 'grid-apps' });
 
@@ -936,80 +940,134 @@ const views = {
   },
 
   async authConfigs(v) {
-    const { items: providers } = await api('GET', '/v1/oauth-providers');
+    const [{ items: providers }, configs] = await Promise.all([
+      api('GET', '/v1/oauth-providers'),
+      api('GET', '/v1/auth-configs'),
+    ]);
     const panel = el('div');
     const label = (p) =>
       p.source === 'tenant'
         ? el('span', { class: 'status-ACTIVE' }, 'Your app')
-        : p.source === 'platform'
-          ? el('span', { class: 'status-ACTIVE' }, 'Platform app')
-          : el('span', { class: 'status-EXPIRED' }, 'Not set up');
+        : p.source === 'partial'
+          ? el(
+              'span',
+              { class: 'status-EXPIRED' },
+              `Your app on ${p.toolkits.filter((t) => t.uses_own_app).length} of ${p.toolkits.length}`,
+            )
+          : p.source === 'platform'
+            ? el('span', { class: 'status-ACTIVE' }, 'Platform app')
+            : el('span', { class: 'status-EXPIRED' }, 'Not set up');
+    // Per-app settings made through the API (custom scopes, a pinned platform app) stay visible and removable here.
+    const custom = configs.items.filter((c) => (c.scopes && c.scopes.length) || c.scheme !== 'OAUTH2');
+    // append() would turn null into the text "null".
     v.append(
-      el(
-        'div',
-        { class: 'head' },
+      ...[
         el(
           'div',
-          {},
-          el('h1', {}, 'Sign-in setup'),
+          { class: 'head' },
           el(
             'div',
-            { class: 'muted' },
-            'Set each provider up once. Everyone in this tenant then connects its apps by signing in, with no keys to paste.',
+            {},
+            el('h1', {}, 'Sign-in setup'),
+            el(
+              'div',
+              { class: 'muted' },
+              'Set each provider up once. Everyone in this tenant then connects its apps by signing in, with no keys to paste.',
+            ),
           ),
         ),
-      ),
-      panel,
-      el(
-        'div',
-        { class: 'card' },
-        table(
-          ['Provider', 'Apps', 'Sign-in', ''],
-          providers.map((p) => [
-            el('strong', {}, p.name),
-            p.toolkits.map((t) => el('span', { class: 'chip' }, t.name)),
-            label(p),
-            actions(
-              el(
-                'button',
-                {
-                  class: p.source === 'none' ? 'small' : 'ghost small',
-                  onclick: () => {
-                    panel.replaceChildren(
-                      providerSetupCard(
-                        p,
-                        () => route(),
-                        () => panel.replaceChildren(),
-                      ),
-                    );
-                    panel.scrollIntoView({ behavior: 'smooth' });
-                  },
-                },
-                p.source === 'none' ? 'Set up' : p.source === 'tenant' ? 'Change' : 'Use your own app',
-              ),
-              p.source === 'tenant'
-                ? el(
-                    'button',
-                    {
-                      class: 'danger small',
-                      onclick: async () =>
-                        confirm(
-                          `Remove your ${p.name} app? Sign-in falls back to the platform app if there is one.`,
-                        ) &&
-                        (await guard(
-                          () => api('DELETE', `/v1/oauth-providers/${encodeURIComponent(p.provider)}`),
-                          'Removed',
-                        )) !== undefined &&
-                        route(),
+        panel,
+        el(
+          'div',
+          { class: 'card' },
+          table(
+            ['Provider', 'Apps', 'Sign-in', ''],
+            providers.map((p) => [
+              el('strong', {}, p.name),
+              p.toolkits.map((t) => el('span', { class: 'chip' }, t.name)),
+              label(p),
+              actions(
+                el(
+                  'button',
+                  {
+                    class: p.source === 'none' ? 'small' : 'ghost small',
+                    onclick: () => {
+                      panel.replaceChildren(
+                        providerSetupCard(
+                          p,
+                          () => route(),
+                          () => panel.replaceChildren(),
+                        ),
+                      );
+                      panel.scrollIntoView({ behavior: 'smooth' });
                     },
-                    'Remove',
-                  )
-                : null,
-            ),
-          ]),
-          'No apps here use OAuth sign-in.',
+                  },
+                  p.source === 'none'
+                    ? 'Set up'
+                    : p.source === 'tenant'
+                      ? 'Change'
+                      : p.source === 'partial'
+                        ? 'Use for all apps'
+                        : 'Use your own app',
+                ),
+                p.source === 'tenant' || p.source === 'partial'
+                  ? el(
+                      'button',
+                      {
+                        class: 'danger small',
+                        onclick: async () =>
+                          confirm(
+                            `Remove your ${p.name} app? Sign-in falls back to the platform app if there is one.`,
+                          ) &&
+                          (await guard(
+                            () => api('DELETE', `/v1/oauth-providers/${encodeURIComponent(p.provider)}`),
+                            'Removed',
+                          )) !== undefined &&
+                          route(),
+                      },
+                      'Remove',
+                    )
+                  : null,
+              ),
+            ]),
+            'No apps here use OAuth sign-in.',
+          ),
         ),
-      ),
+        custom.length
+          ? el(
+              'div',
+              { class: 'card' },
+              el('h2', {}, 'Per-app settings'),
+              el(
+                'p',
+                { class: 'muted' },
+                'Made through the API. Saving a provider above keeps their scopes.',
+              ),
+              table(
+                ['App', 'Sign-in', 'Scopes', ''],
+                custom.map((c) => [
+                  c.toolkit,
+                  c.scheme !== 'OAUTH2' ? c.scheme : c.use_platform_app ? 'platform app' : 'your app',
+                  (c.scopes || []).map((x) => el('span', { class: 'chip' }, x)),
+                  actions(
+                    el(
+                      'button',
+                      {
+                        class: 'danger small',
+                        onclick: async () =>
+                          confirm(`Delete this ${c.toolkit} setting?`) &&
+                          (await guard(() => api('DELETE', `/v1/auth-configs/${c.id}`), 'Deleted')) !==
+                            undefined &&
+                          route(),
+                      },
+                      'Delete',
+                    ),
+                  ),
+                ]),
+              ),
+            )
+          : null,
+      ].filter(Boolean),
     );
   },
 
@@ -1211,6 +1269,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('hashchange', route);
   $('#logout').addEventListener('click', () => {
     setKey(null);
+    setMe('');
     showLogin();
   });
   $('#login-form').addEventListener('submit', async (ev) => {
@@ -1229,10 +1288,19 @@ document.addEventListener('DOMContentLoaded', () => {
   const back = new URLSearchParams(location.search);
   if (back.has('status')) {
     history.replaceState(null, '', location.pathname + location.hash);
+    const messages = {
+      cancelled: 'Sign-in was cancelled. Nothing was connected.',
+      provider_error: 'The app did not finish sign-in. Try again.',
+      connect_failed: 'The connection could not be saved. Try again.',
+    };
+    // Only fixed text: the address bar is attacker-controllable.
     if (back.get('status') === 'success')
       setTimeout(() => toast('Connected. The hub keeps this connection for you.'), 300);
     else
-      setTimeout(() => toast(back.get('error') || 'The connection did not complete. Try again.', true), 300);
+      setTimeout(
+        () => toast(messages[back.get('error')] || 'The connection did not complete. Try again.', true),
+        300,
+      );
   }
   if (memKey) showApp();
   else showLogin();

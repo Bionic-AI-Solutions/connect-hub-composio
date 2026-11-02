@@ -186,8 +186,8 @@ export class ConnectionService {
       .filter((tk) => tk.authSchemes.some((s) => s.type === 'OAUTH2' && s.oauth2?.provider === provider));
   }
 
-  /** Every OAuth provider the catalog uses, whether an OAuth app is set (platform-wide or this tenant's own). */
-  async oauthProviders(tenantId: string) {
+  /** Toolkits that use this tenant's own OAuth app: the newest OAUTH2 config per toolkit (as sign-in resolves it). */
+  private async ownOAuthApps(tenantId: string): Promise<Map<string, string>> {
     const { rows } = await this.db.query<{
       toolkit: string;
       client_id: string | null;
@@ -197,21 +197,28 @@ export class ConnectionService {
         WHERE tenant_id = $1 AND scheme = 'OAUTH2' ORDER BY toolkit, created_at DESC`,
       [tenantId],
     );
-    const own = new Map(
+    return new Map(
       rows.filter((r) => !r.use_platform_app && r.client_id).map((r) => [r.toolkit, r.client_id!]),
     );
+  }
+
+  /** Every OAuth provider the catalog uses, whether an OAuth app is set (platform-wide or this tenant's own). */
+  async oauthProviders(tenantId: string) {
+    const own = await this.ownOAuthApps(tenantId);
     const providers = new Map<string, Toolkit[]>();
     for (const tk of this.registry.listToolkits())
-      for (const s of tk.authSchemes)
-        if (s.type === 'OAUTH2' && s.oauth2)
-          providers.set(s.oauth2.provider, [...(providers.get(s.oauth2.provider) ?? []), tk]);
+      for (const sc of tk.authSchemes)
+        if (sc.type === 'OAUTH2' && sc.oauth2)
+          providers.set(sc.oauth2.provider, [...(providers.get(sc.oauth2.provider) ?? []), tk]);
     return [...providers.entries()]
       .map(([provider, tks]) => {
-        const tenantClientIds = [...new Set(tks.map((tk) => own.get(tk.slug)).filter(Boolean))] as string[];
+        const withOwn = tks.filter((tk) => own.has(tk.slug));
+        const tenantClientIds = [...new Set(withOwn.map((tk) => own.get(tk.slug)!))];
+        const platform = !!this.config.platformOAuthApps[provider];
         const setup = PROVIDER_SETUP[provider];
         const scopes = [
           ...new Set(
-            tks.flatMap((tk) => tk.authSchemes.find((s) => s.type === 'OAUTH2')?.oauth2?.scopes ?? []),
+            tks.flatMap((tk) => tk.authSchemes.find((x) => x.type === 'OAUTH2')?.oauth2?.scopes ?? []),
           ),
         ];
         return {
@@ -221,20 +228,34 @@ export class ConnectionService {
           note: setup?.note ?? null,
           callback_url: this.redirectUri,
           scopes,
-          toolkits: tks.map((tk) => ({ slug: tk.slug, name: tk.name })),
-          // Which OAuth app sign-in uses: the tenant's own (per app, newest wins) or the platform's.
-          source: tenantClientIds.length
-            ? 'tenant'
-            : this.config.platformOAuthApps[provider]
-              ? 'platform'
-              : 'none',
+          toolkits: tks.map((tk) => ({ slug: tk.slug, name: tk.name, uses_own_app: own.has(tk.slug) })),
+          // tenant: every app uses the tenant's own OAuth app; partial: only some do (the rest use the platform app or
+          // cannot sign in yet); platform / none: no own app at all.
+          source:
+            withOwn.length === tks.length
+              ? 'tenant'
+              : withOwn.length
+                ? 'partial'
+                : platform
+                  ? 'platform'
+                  : 'none',
+          platform_app: platform,
           client_id: tenantClientIds.length === 1 ? tenantClientIds[0] : null,
         };
       })
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  /** Store one OAuth app for every app of a provider, so a person only enters the keys once. */
+  async oauthProvider(tenantId: string, provider: string) {
+    const p = (await this.oauthProviders(tenantId)).find((x) => x.provider === provider);
+    if (!p) throw notFound(`OAuth provider "${provider}"`);
+    return p;
+  }
+
+  /** Store one OAuth app for every app of a provider, so a person only enters the keys once. Each toolkit's newest
+   *  OAUTH2 config is updated in place (keeping its id, so in-flight sign-ins and auth_config_id references survive, and
+   *  any custom scopes); a toolkit without one gets a new row. Every write is a single statement, so concurrent saves
+   *  never leave a toolkit without a config. */
   async setProviderApp(
     tenantId: string,
     provider: string,
@@ -247,38 +268,49 @@ export class ConnectionService {
     if (!clientId || !clientSecret) throw badRequest('client_id and client_secret are required');
     if (clientId.length > 500 || clientSecret.length > 2000)
       throw badRequest('client_id or client_secret is too long');
-    const ids: string[] = [];
-    // New rows first: sign-in always picks the newest config, so there is never a moment without one.
     for (const tk of tks) {
-      const id = newId('ac');
-      ids.push(id);
-      await this.db.query(
-        `INSERT INTO auth_configs (id, tenant_id, toolkit, scheme, use_platform_app, client_id, client_secret_enc, scopes)
-         VALUES ($1,$2,$3,'OAUTH2',false,$4,$5,NULL)`,
-        [id, tenantId, tk.slug, clientId, this.vault.encrypt(clientSecret, tenantId)],
+      const secretEnc = this.vault.encrypt(clientSecret, tenantId);
+      const updated = await this.db.query(
+        `UPDATE auth_configs SET use_platform_app = false, client_id = $3, client_secret_enc = $4
+          WHERE id = (SELECT id FROM auth_configs WHERE tenant_id = $1 AND toolkit = $2 AND scheme = 'OAUTH2'
+                       ORDER BY created_at DESC LIMIT 1)
+            AND tenant_id = $1
+          RETURNING id`,
+        [tenantId, tk.slug, clientId, secretEnc],
       );
+      if (!updated.rows.length)
+        await this.db.query(
+          `INSERT INTO auth_configs (id, tenant_id, toolkit, scheme, use_platform_app, client_id, client_secret_enc, scopes)
+           VALUES ($1,$2,$3,'OAUTH2',false,$4,$5,NULL)`,
+          [newId('ac'), tenantId, tk.slug, clientId, secretEnc],
+        );
     }
-    await this.db.query(
-      `DELETE FROM auth_configs WHERE tenant_id = $1 AND scheme = 'OAUTH2' AND toolkit = ANY($2::text[]) AND NOT (id = ANY($3::text[]))`,
-      [tenantId, tks.map((tk) => tk.slug), ids],
-    );
-    return (await this.oauthProviders(tenantId)).find((p) => p.provider === provider)!;
+    return this.oauthProvider(tenantId, provider);
   }
 
-  /** Remove this tenant's own OAuth app for a provider; sign-in falls back to the platform app, if any. */
+  /** Remove this tenant's own OAuth app for a provider; sign-in falls back to the platform app, if any. Configs that
+   *  carry custom scopes are kept and switched to the platform app, so the scopes survive. */
   async clearProviderApp(tenantId: string, provider: string) {
     const tks = this.providerToolkits(provider);
     if (!tks.length) throw notFound(`OAuth provider "${provider}"`);
+    const slugs = tks.map((tk) => tk.slug);
     await this.db.query(
-      `DELETE FROM auth_configs WHERE tenant_id = $1 AND scheme = 'OAUTH2' AND toolkit = ANY($2::text[])`,
-      [tenantId, tks.map((tk) => tk.slug)],
+      `UPDATE auth_configs SET use_platform_app = true, client_id = NULL, client_secret_enc = NULL
+        WHERE tenant_id = $1 AND scheme = 'OAUTH2' AND toolkit = ANY($2::text[]) AND use_platform_app = false
+          AND scopes IS NOT NULL`,
+      [tenantId, slugs],
     );
-    return (await this.oauthProviders(tenantId)).find((p) => p.provider === provider)!;
+    await this.db.query(
+      `DELETE FROM auth_configs WHERE tenant_id = $1 AND scheme = 'OAUTH2' AND toolkit = ANY($2::text[])
+          AND use_platform_app = false`,
+      [tenantId, slugs],
+    );
+    return this.oauthProvider(tenantId, provider);
   }
 
   /** The app picker: every toolkit with whether it can be connected now and this person's accounts. */
   async appsOverview(tenantId: string, userId?: string) {
-    const providers = new Map((await this.oauthProviders(tenantId)).map((p) => [p.provider, p]));
+    const own = await this.ownOAuthApps(tenantId);
     const { rows } = await this.db.query<{ toolkit: string; status: string; n: string }>(
       `SELECT toolkit, status, count(*)::text AS n FROM connected_accounts
         WHERE tenant_id = $1 AND ($2::text IS NULL OR user_id = $2) GROUP BY toolkit, status`,
@@ -289,11 +321,18 @@ export class ConnectionService {
       counts.set(r.toolkit, { ...(counts.get(r.toolkit) ?? {}), [r.status]: Number(r.n) });
     return this.registry.listToolkits().map((tk) => {
       const oauth = tk.authSchemes.find((s) => s.type === 'OAUTH2')?.oauth2;
-      const provider = oauth ? providers.get(oauth.provider) : undefined;
+      // Readiness per toolkit, exactly as sign-in resolves it: this tenant's own app for the toolkit, else the platform's.
+      const oauthSource = !oauth
+        ? null
+        : own.has(tk.slug)
+          ? 'tenant'
+          : this.config.platformOAuthApps[oauth.provider]
+            ? 'platform'
+            : 'none';
       const other = tk.authSchemes
         .filter((s) => s.type !== 'OAUTH2' && s.type !== 'NO_AUTH')
         .map((s) => s.type);
-      const oauthReady = !!provider && provider.source !== 'none';
+      const oauthReady = oauthSource === 'tenant' || oauthSource === 'platform';
       const c = counts.get(tk.slug) ?? {};
       return {
         slug: tk.slug,
@@ -310,7 +349,7 @@ export class ConnectionService {
               ? 'none'
               : 'setup_required',
         oauth_provider: oauth?.provider ?? null,
-        oauth_source: provider?.source ?? null,
+        oauth_source: oauthSource,
         other_schemes: other,
         accounts: { active: c.ACTIVE ?? 0, needs_attention: (c.EXPIRED ?? 0) + (c.FAILED ?? 0) },
       };
@@ -379,7 +418,12 @@ export class ConnectionService {
       throw badRequest('redirect_url is not a valid URL');
     }
     const isLocal = u.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(u.hostname);
-    const isHub = u.origin === new URL(this.config.PUBLIC_URL).origin;
+    // Back to the hub's own dashboard only. Any other hub path could chain onward (e.g. /oauth2/authorize).
+    const isHub =
+      u.origin === new URL(this.config.PUBLIC_URL).origin &&
+      u.pathname === '/dashboard' &&
+      !u.username &&
+      !u.password;
     if (!isLocal && !isHub && !this.config.allowedRedirectOrigins.includes(u.origin)) {
       throw badRequest(`redirect_url origin ${u.origin} is not in ALLOWED_REDIRECT_ORIGINS`);
     }
@@ -533,6 +577,18 @@ export class ConnectionService {
   }
 
   /** Complete an OAuth2 flow from the provider callback. Returns the request (for the redirect) and the account. */
+  /** Where a sign-in started from, for sending the person back after a failure. Trusts only a signed state; the
+   *  redirect_url was validated when the link was created. */
+  async redirectForState(state: string): Promise<string | null> {
+    const [id, sig] = String(state ?? '').split('.');
+    if (!id || !sig || !this.vault.verify(`state:${id}`, sig)) return null;
+    const { rows } = await this.db.query<{ redirect_url: string | null }>(
+      'SELECT redirect_url FROM connect_requests WHERE id = $1',
+      [id],
+    );
+    return rows[0]?.redirect_url ?? null;
+  }
+
   async completeOAuth(
     state: string,
     code: string,

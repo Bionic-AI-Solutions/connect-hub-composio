@@ -208,3 +208,95 @@ describe('One-time OAuth setup per provider', () => {
     expect((await ctx.app.inject({ method: 'GET', url: '/v1/oauth-providers' })).statusCode).toBe(401);
   });
 });
+
+describe('Review fixes', () => {
+  it('only lets a connect link return to the hub dashboard, not other hub pages', async () => {
+    ctx = await setup({ withProvider: true });
+    const link = (redirect_url: string) =>
+      ctx!.app.inject({
+        method: 'POST',
+        url: '/v1/connected-accounts/link',
+        headers: ctx!.auth,
+        payload: { user_id: 'u1', toolkit: 'mockapp', redirect_url },
+      });
+    expect((await link('http://hub.test/dashboard#apps')).statusCode).toBe(201);
+    expect(
+      (await link('http://hub.test/oauth2/authorize?client_id=x&redirect_uri=https://evil.example/'))
+        .statusCode,
+    ).toBe(400);
+    expect((await link('http://hub.test/connect/abc')).statusCode).toBe(400);
+    expect((await link('http://attacker@hub.test/dashboard')).statusCode).toBe(400);
+  });
+
+  it('sends a cancelled sign-in back to the dashboard with a fixed error code', async () => {
+    ctx = await setup({ withProvider: true });
+    const authorize = await startSignIn(ctx, 'u1', 'http://hub.test/dashboard#apps');
+    const cb = await ctx.app.inject({
+      method: 'GET',
+      url: `/oauth/callback?error=access_denied&error_description=${encodeURIComponent('<b>spoof</b>')}&state=${encodeURIComponent(authorize.searchParams.get('state')!)}`,
+    });
+    expect(cb.statusCode).toBe(302);
+    const back = new URL(cb.headers.location as string);
+    expect(back.pathname).toBe('/dashboard');
+    expect(back.searchParams.get('status')).toBe('error');
+    expect(back.searchParams.get('error')).toBe('cancelled');
+    expect(back.toString()).not.toContain('spoof');
+    // A forged state gets the plain error page, not a redirect.
+    const forged = await ctx.app.inject({
+      method: 'GET',
+      url: '/oauth/callback?error=access_denied&state=cr_x.bad',
+    });
+    expect(forged.statusCode).toBe(400);
+  });
+
+  it('keeps per-app custom scopes and the config id when the provider app is saved or removed', async () => {
+    ctx = await setup({ withProvider: true });
+    const created = (
+      await ctx.app.inject({
+        method: 'POST',
+        url: '/v1/auth-configs',
+        headers: ctx.auth,
+        payload: { toolkit: 'mockapp', scopes: ['custom.read'] },
+      })
+    ).json();
+    const put = await ctx.app.inject({
+      method: 'PUT',
+      url: '/v1/oauth-providers/mockapp',
+      headers: ctx.auth,
+      payload: { client_id: 'tenant-client', client_secret: 'tenant-secret' },
+    });
+    expect(put.json()).toMatchObject({ source: 'tenant' });
+    const rows = async () =>
+      (
+        await ctx!.services.db.query(
+          "SELECT id, scopes, use_platform_app, client_id FROM auth_configs WHERE tenant_id = $1 AND toolkit = 'mockapp'",
+          [ctx!.tenant.id],
+        )
+      ).rows;
+    expect(await rows()).toEqual([
+      { id: created.id, scopes: ['custom.read'], use_platform_app: false, client_id: 'tenant-client' },
+    ]);
+    const authorize = await startSignIn(ctx, 'u1');
+    expect(authorize.searchParams.get('client_id')).toBe('tenant-client');
+    expect(authorize.searchParams.get('scope')).toContain('custom.read');
+    await ctx.app.inject({ method: 'DELETE', url: '/v1/oauth-providers/mockapp', headers: ctx.auth });
+    expect(await rows()).toEqual([
+      { id: created.id, scopes: ['custom.read'], use_platform_app: true, client_id: null },
+    ]);
+    expect((await startSignIn(ctx, 'u1')).searchParams.get('client_id')).toBe('mock-client');
+  });
+
+  it('reads one provider, and 404s an unknown one', async () => {
+    ctx = await setup({ withProvider: true });
+    const one = await ctx.app.inject({
+      method: 'GET',
+      url: '/v1/oauth-providers/mockapp',
+      headers: ctx.auth,
+    });
+    expect(one.json()).toMatchObject({ provider: 'mockapp', source: 'platform', platform_app: true });
+    expect(
+      (await ctx.app.inject({ method: 'GET', url: '/v1/oauth-providers/nope', headers: ctx.auth }))
+        .statusCode,
+    ).toBe(404);
+  });
+});
