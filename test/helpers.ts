@@ -15,14 +15,20 @@ export async function startMockProvider() {
   const state = {
     issued: 0,
     lastTokenRequest: null as Record<string, string> | null,
+    lastTokenContentType: '',
     challenges: new Map<string, string>(),
     validTokens: new Set<string>(),
+    /** Refresh tokens rotate: each works once, like Atlassian's and many others. */
+    usedRefreshTokens: new Set<string>(),
+    refreshCount: 0,
+    refreshDelayMs: 0,
   };
   const app: FastifyInstance = Fastify();
   await app.register(formbody);
   app.post<{ Body: Record<string, string> }>('/token', async (req, reply) => {
     const b = req.body;
     state.lastTokenRequest = b;
+    state.lastTokenContentType = String(req.headers['content-type'] ?? '');
     if (b.client_id !== 'mock-client' || b.client_secret !== 'mock-secret')
       return reply.status(401).send({ error: 'invalid_client' });
     if (b.grant_type === 'authorization_code') {
@@ -33,7 +39,11 @@ export async function startMockProvider() {
       if (!challenge || challenge !== expected)
         return reply.status(400).send({ error: 'invalid_grant', error_description: 'PKCE mismatch' });
     } else if (b.grant_type === 'refresh_token') {
-      if (b.refresh_token === 'revoked') return reply.status(400).send({ error: 'invalid_grant' });
+      if (b.refresh_token === 'revoked' || state.usedRefreshTokens.has(b.refresh_token))
+        return reply.status(400).send({ error: 'invalid_grant' });
+      state.usedRefreshTokens.add(b.refresh_token);
+      state.refreshCount++;
+      if (state.refreshDelayMs) await new Promise((r) => setTimeout(r, state.refreshDelayMs));
     } else {
       return reply.status(400).send({ error: 'unsupported_grant_type' });
     }
@@ -68,7 +78,7 @@ export async function startMockProvider() {
   };
 }
 
-export function mockOAuthToolkit(base: string) {
+export function mockOAuthToolkit(base: string, opts: { tokenFormat?: 'form' | 'json' } = {}) {
   return defineToolkit({
     slug: 'mockapp',
     name: 'Mock App',
@@ -87,6 +97,7 @@ export function mockOAuthToolkit(base: string) {
           pkceMethod: 'S256',
           authorizeParams: {},
           clientAuth: 'body',
+          tokenFormat: opts.tokenFormat,
           provider: 'mockapp',
         },
       },
@@ -106,6 +117,9 @@ export function mockOAuthToolkit(base: string) {
 }
 
 /** A fake Activepieces piece, run through the real adapter. */
+/** Records trigger lifecycle calls made by the fake piece, for assertions. */
+export const fakeTriggerLog: { event: string; detail?: unknown }[] = [];
+
 export const fakePiece: ApPiece = {
   displayName: 'Fake Piece',
   description: 'Adapter test piece',
@@ -116,6 +130,59 @@ export const fakePiece: ApPiece = {
     validate: async ({ auth }: { auth: string }) =>
       auth === 'good-key' ? { valid: true } : { valid: false, error: 'bad key' },
   },
+  triggers: () => ({
+    new_item: {
+      name: 'new_item',
+      displayName: 'New item',
+      description: 'Polls for new items',
+      type: 'POLLING',
+      props: { label: { type: 'SHORT_TEXT', displayName: 'Label', required: true } },
+      onEnable: async (ctx: any) => {
+        await ctx.store.put('cursor', 0);
+        fakeTriggerLog.push({ event: 'enable', detail: ctx.propsValue });
+      },
+      onDisable: async () => {
+        fakeTriggerLog.push({ event: 'disable:new_item' });
+      },
+      run: async (ctx: any) => {
+        const cursor = (await ctx.store.get('cursor')) ?? 0;
+        await ctx.store.put('cursor', cursor + 2);
+        return [
+          { n: cursor + 1, label: ctx.propsValue.label, secret: ctx.auth.secret_text },
+          { n: cursor + 2, label: ctx.propsValue.label },
+        ];
+      },
+    },
+    on_event: {
+      name: 'on_event',
+      displayName: 'On event',
+      description: 'Provider pushes events',
+      type: 'WEBHOOK',
+      props: {},
+      handshakeConfiguration: { strategy: 'QUERY_PRESENT', paramName: 'challenge' },
+      onHandshake: async (ctx: any) => ({
+        status: 200,
+        body: { challenge: ctx.payload.queryParams.challenge },
+      }),
+      onEnable: async (ctx: any) => {
+        await ctx.store.put('registered', ctx.webhookUrl);
+        fakeTriggerLog.push({ event: 'register', detail: ctx.webhookUrl });
+      },
+      onDisable: async (ctx: any) => {
+        fakeTriggerLog.push({ event: 'unregister', detail: await ctx.store.get('registered') });
+      },
+      run: async (ctx: any) => (ctx.payload.body?.ignore ? [] : [ctx.payload.body]),
+    },
+    app_only: {
+      name: 'app_only',
+      displayName: 'App webhook',
+      type: 'APP_WEBHOOK',
+      props: {},
+      onEnable: async () => undefined,
+      onDisable: async () => undefined,
+      run: async () => [],
+    },
+  }),
   actions: () => ({
     echo: {
       name: 'echo',
@@ -143,7 +210,9 @@ export const fakePiece: ApPiece = {
   }),
 };
 
-export async function setup(opts: { withProvider?: boolean } = {}) {
+export async function setup(
+  opts: { withProvider?: boolean; tokenFormat?: 'form' | 'json'; env?: Record<string, string> } = {},
+) {
   const provider = opts.withProvider ? await startMockProvider() : undefined;
   const config: Config = loadConfig({
     DATABASE_URL: 'pglite:memory',
@@ -151,14 +220,17 @@ export async function setup(opts: { withProvider?: boolean } = {}) {
     ADMIN_TOKEN,
     PUBLIC_URL: 'http://hub.test',
     REFRESH_SWEEP_SECONDS: '0',
+    TRIGGER_TICK_SECONDS: '0',
+    TRIGGER_ALLOW_PRIVATE_WEBHOOKS: 'true',
     OAUTH_MOCKAPP_CLIENT_ID: 'mock-client',
     OAUTH_MOCKAPP_CLIENT_SECRET: 'mock-secret',
     ALLOWED_REDIRECT_ORIGINS: 'https://app.example.com',
+    ...opts.env,
   } as any);
   const db = await openDb(config.DATABASE_URL);
   await migrate(db);
   const toolkits = [...NATIVE_TOOLKITS, pieceToToolkit('fake', fakePiece, '1.0.0')];
-  if (provider) toolkits.push(mockOAuthToolkit(provider.base));
+  if (provider) toolkits.push(mockOAuthToolkit(provider.base, { tokenFormat: opts.tokenFormat }));
   const services: Services = createServices(config, db, new Registry(toolkits));
   const app = await buildApp(services, { logger: false });
   const res = await app.inject({

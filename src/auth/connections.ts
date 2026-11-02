@@ -63,6 +63,7 @@ const toIso = (d: Date | string | null) => (d == null ? null : new Date(d).toISO
 
 function publicAccount(r: AccountRow): PublicAccount {
   const { credentials_enc: _omit, ...rest } = r;
+  delete (rest as Record<string, unknown>).refresh_lock_until;
   return {
     ...rest,
     expires_at: toIso(r.expires_at),
@@ -152,7 +153,7 @@ export class ConnectionService {
         scheme.type,
         !own,
         input.client_id ?? null,
-        input.client_secret ? this.vault.encrypt(input.client_secret) : null,
+        input.client_secret ? this.vault.encrypt(input.client_secret, tenantId) : null,
         input.scopes ? JSON.stringify(input.scopes) : null,
       ],
     );
@@ -195,9 +196,17 @@ export class ConnectionService {
     }
     const scopes = cfg?.scopes?.length ? cfg.scopes : scheme.oauth2!.scopes;
     if (cfg && !cfg.use_platform_app && cfg.client_id && cfg.client_secret_enc) {
+      const clientSecret = this.vault.decrypt<string>(cfg.client_secret_enc, tenantId);
+      if (this.vault.isStale(cfg.client_secret_enc)) {
+        // Upgrade older envelopes to the tenant-scoped format (conditional, so concurrent upgrades are harmless).
+        await this.db.query(
+          'UPDATE auth_configs SET client_secret_enc = $1 WHERE id = $2 AND client_secret_enc = $3',
+          [this.vault.encrypt(clientSecret, tenantId), cfg.id, cfg.client_secret_enc],
+        );
+      }
       return {
         clientId: cfg.client_id,
-        clientSecret: this.vault.decrypt<string>(cfg.client_secret_enc),
+        clientSecret,
         scopes,
         authConfigId: cfg.id,
       };
@@ -264,7 +273,7 @@ export class ConnectionService {
         tk.slug,
         scheme.type,
         input.auth_config_id ?? null,
-        this.vault.encrypt(secret),
+        this.vault.encrypt(secret, tenantId),
         input.redirect_url ?? null,
         expires,
       ],
@@ -306,11 +315,11 @@ export class ConnectionService {
       (f) => f.required && (props[f.name] === undefined || props[f.name] === ''),
     );
     if (missing.length) throw badRequest(`Missing: ${missing.map((f) => f.displayName).join(', ')}`);
-    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc);
+    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc, req.tenant_id);
     if (scheme.fields.length) {
       secret.props = Object.fromEntries(scheme.fields.map((f) => [f.name, props[f.name]]));
       await this.db.query('UPDATE connect_requests SET secret_enc = $1 WHERE id = $2', [
-        this.vault.encrypt(secret),
+        this.vault.encrypt(secret, req.tenant_id),
         id,
       ]);
     }
@@ -341,20 +350,28 @@ export class ConnectionService {
     tokenUrl: string,
     params: Record<string, string>,
     client: { clientId: string; clientSecret: string },
-    clientAuth: 'body' | 'header',
+    spec: { clientAuth: 'body' | 'header'; tokenFormat?: 'form' | 'json' },
   ): Promise<Record<string, any>> {
+    const json = spec.tokenFormat === 'json';
     const headers: Record<string, string> = {
-      'content-type': 'application/x-www-form-urlencoded',
+      'content-type': json ? 'application/json' : 'application/x-www-form-urlencoded',
       accept: 'application/json',
     };
-    const body = new URLSearchParams(params);
-    if (clientAuth === 'header') {
+    const fields: Record<string, string> = { ...params };
+    if (spec.clientAuth === 'header') {
       headers.authorization = `Basic ${Buffer.from(`${client.clientId}:${client.clientSecret}`).toString('base64')}`;
     } else {
-      body.set('client_id', client.clientId);
-      body.set('client_secret', client.clientSecret);
+      fields.client_id = client.clientId;
+      fields.client_secret = client.clientSecret;
     }
-    const res = await fetch(tokenUrl, { method: 'POST', headers, body });
+    const body = json ? JSON.stringify(fields) : new URLSearchParams(fields);
+    // Bounded well inside the refresh lease, so a slow provider cannot outlive the lease (see refreshWithLease).
+    const res = await fetch(tokenUrl, {
+      method: 'POST',
+      headers,
+      body,
+      signal: AbortSignal.timeout(this.tokenTimeoutMs),
+    });
     const text = await res.text();
     let data: Record<string, any>;
     try {
@@ -382,7 +399,7 @@ export class ConnectionService {
     if (!id || !sig || !this.vault.verify(`state:${id}`, sig))
       throw new AppError(403, 'invalid_state', 'Invalid OAuth state');
     const { req, toolkit, scheme } = await this.loadOpenRequest(id);
-    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc);
+    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc, req.tenant_id);
     const client = await this.oauthClient(req.tenant_id, toolkit, scheme, req.auth_config_id);
     const o = scheme.oauth2!;
     const tokenUrl = fillTemplate(o.tokenUrl, secret.props);
@@ -392,7 +409,7 @@ export class ConnectionService {
       redirect_uri: this.redirectUri,
     };
     if (o.pkce) params.code_verifier = secret.codeVerifier;
-    const data = await this.tokenRequest(tokenUrl, params, client, o.clientAuth);
+    const data = await this.tokenRequest(tokenUrl, params, client, o);
     const accessToken = data.access_token ?? data.authed_user?.access_token;
     if (!accessToken) throw new AppError(502, 'oauth_token_error', 'Token response had no access_token');
     const value: ConnectionValue = {
@@ -525,7 +542,7 @@ export class ConnectionService {
         tk.slug,
         scheme,
         authConfigId,
-        this.vault.encrypt(value),
+        this.vault.encrypt(value, tenantId),
         identifier ?? null,
         expiresAt,
       ],
@@ -601,7 +618,7 @@ export class ConnectionService {
         `Connected account ${row.id} is ${row.status}${row.last_error ? `: ${row.last_error}` : ''}. Reconnect it.`,
       );
     }
-    let value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+    let value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!, row.tenant_id);
     if (
       value.type === 'OAUTH2' &&
       row.expires_at &&
@@ -610,32 +627,91 @@ export class ConnectionService {
       value = await this.refresh(row, value);
     }
     if (this.vault.isStale(row.credentials_enc!)) {
-      await this.db.query('UPDATE connected_accounts SET credentials_enc = $1 WHERE id = $2', [
-        this.vault.encrypt(value),
-        row.id,
-      ]);
+      // Conditional: never overwrite credentials another replica stored after we read the row.
+      await this.db.query(
+        'UPDATE connected_accounts SET credentials_enc = $1 WHERE id = $2 AND credentials_enc = $3',
+        [this.vault.encrypt(value, row.tenant_id), row.id, row.credentials_enc],
+      );
     }
     return { account: publicAccount(row), value };
   }
 
   async forceRefresh(tenantId: string, id: string): Promise<PublicAccount> {
     const row = await this.row(tenantId, id);
-    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!, row.tenant_id);
     if (value.type !== 'OAUTH2') throw badRequest('Only OAuth2 accounts can be refreshed');
-    await this.refresh(row, value);
+    await this.refresh(row, value, true);
     return this.getAccount(tenantId, id);
   }
 
   private refresh(
     row: AccountRow,
-    value: Extract<ConnectionValue, { type: 'OAUTH2' }>,
+    _value: Extract<ConnectionValue, { type: 'OAUTH2' }>,
+    force = false,
   ): Promise<ConnectionValue> {
-    // One in-flight refresh per account per process; refresh tokens are often single-use.
+    // One in-flight refresh per account per process (cheap), plus a database lease so replicas never refresh the
+    // same account at the same time. Refresh tokens are often single-use.
     const existing = this.refreshing.get(row.id);
     if (existing) return existing;
-    const p = this.doRefresh(row, value).finally(() => this.refreshing.delete(row.id));
+    const p = this.refreshWithLease(row.id, force).finally(() => this.refreshing.delete(row.id));
     this.refreshing.set(row.id, p);
     return p;
+  }
+
+  private static readonly LEASE_WAIT_MS = 15_000;
+  /** Lease length. Must stay well above tokenTimeoutMs so a refresh never outlives its lease. */
+  leaseSeconds = 30;
+  /** Token endpoint timeout. */
+  tokenTimeoutMs = 15_000;
+
+  private async refreshWithLease(accountId: string, force: boolean): Promise<ConnectionValue> {
+    const deadline = Date.now() + ConnectionService.LEASE_WAIT_MS;
+    // A forced refresh that had to wait for another replica's refresh does not refresh again.
+    for (let attempt = 0; ; attempt++) {
+      const leased = (
+        await this.db.query<AccountRow & { refresh_lock_until: Date | string }>(
+          `UPDATE connected_accounts SET refresh_lock_until = now() + make_interval(secs => $2)
+           WHERE id = $1 AND (refresh_lock_until IS NULL OR refresh_lock_until < now()) RETURNING *`,
+          [accountId, this.leaseSeconds],
+        )
+      ).rows[0];
+      if (leased) {
+        try {
+          return await this.refreshLeased(leased, force && attempt === 0);
+        } finally {
+          // Release only our own lease: if it expired and another replica took it, leave theirs alone.
+          await this.db.query(
+            'UPDATE connected_accounts SET refresh_lock_until = NULL WHERE id = $1 AND refresh_lock_until = $2',
+            [accountId, leased.refresh_lock_until],
+          );
+        }
+      }
+      // Another replica holds the lease: wait for it, then use whatever it stored.
+      if (Date.now() > deadline) {
+        throw new AppError(
+          503,
+          'refresh_busy',
+          'A token refresh for this account is still running; retry shortly',
+        );
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+
+  /** Runs while holding the lease, on a freshly read row (another replica may have refreshed already). */
+  private async refreshLeased(row: AccountRow, force: boolean): Promise<ConnectionValue> {
+    if (row.status !== 'ACTIVE') {
+      throw new AppError(
+        409,
+        'account_not_active',
+        `Connected account ${row.id} is ${row.status}. Reconnect it.`,
+      );
+    }
+    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!, row.tenant_id);
+    if (value.type !== 'OAUTH2') return value;
+    const fresh = !row.expires_at || new Date(row.expires_at).getTime() - Date.now() > 5 * 60_000;
+    if (fresh && !force) return value;
+    return this.doRefresh(row, value);
   }
 
   private async doRefresh(
@@ -656,7 +732,7 @@ export class ConnectionService {
         value.token_url,
         { grant_type: 'refresh_token', refresh_token: value.refresh_token },
         { clientId: value.client_id, clientSecret: value.client_secret },
-        scheme.oauth2!.clientAuth,
+        scheme.oauth2!,
       );
       const next: ConnectionValue = {
         ...value,
@@ -669,17 +745,29 @@ export class ConnectionService {
       };
       const expiresAt = next.expires_in ? new Date((next.claimed_at + next.expires_in) * 1000) : null;
       await this.db.query(
-        `UPDATE connected_accounts SET credentials_enc = $1, expires_at = $2, last_error = NULL, updated_at = now() WHERE id = $3`,
-        [this.vault.encrypt(next), expiresAt, row.id],
+        `UPDATE connected_accounts SET credentials_enc = $1, expires_at = $2, status = 'ACTIVE', last_error = NULL,
+           updated_at = now() WHERE id = $3`,
+        [this.vault.encrypt(next, row.tenant_id), expiresAt, row.id],
       );
       return next;
     } catch (e) {
       const err = e as AppError;
       if (err.code === 'invalid_grant') {
-        await this.db.query(
-          `UPDATE connected_accounts SET status = 'EXPIRED', last_error = $1, updated_at = now() WHERE id = $2`,
-          [err.message, row.id],
+        // Only expire the account if nobody stored new credentials meanwhile. With rotating refresh tokens, an
+        // invalid_grant can simply mean another replica already used this refresh token successfully.
+        const expired = await this.db.query(
+          `UPDATE connected_accounts SET status = 'EXPIRED', last_error = $1, updated_at = now()
+           WHERE id = $2 AND credentials_enc = $3 RETURNING id`,
+          [err.message, row.id, row.credentials_enc],
         );
+        if (!expired.rows.length) {
+          const current = (
+            await this.db.query<AccountRow>('SELECT * FROM connected_accounts WHERE id = $1', [row.id])
+          ).rows[0];
+          if (current?.status === 'ACTIVE' && current.credentials_enc) {
+            return this.vault.decrypt<ConnectionValue>(current.credentials_enc, current.tenant_id);
+          }
+        }
         throw new AppError(
           409,
           'account_not_active',
@@ -703,7 +791,7 @@ export class ConnectionService {
     let failed = 0;
     for (const row of rows) {
       try {
-        const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+        const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!, row.tenant_id);
         if (value.type !== 'OAUTH2') continue;
         await this.refresh(row, value);
         refreshed++;

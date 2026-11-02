@@ -5,6 +5,7 @@ import type { Registry } from '../catalog/registry.js';
 import { ToolInputError, type ExecutionContext, type OptionsResult, type Toolkit } from '../catalog/types.js';
 import { ProviderError } from '../catalog/native/define.js';
 import { AppError, badRequest, notFound } from '../errors.js';
+import type { UsageService } from '../tenancy/usage.js';
 
 export interface ExecuteRequest {
   tenantId: string;
@@ -59,6 +60,7 @@ export class Executor {
     private readonly registry: Registry,
     private readonly connections: ConnectionService,
     private readonly config: Config,
+    private readonly usage?: UsageService,
   ) {}
 
   private resolve(slug: string): { toolkit: Toolkit; action: string } {
@@ -121,10 +123,14 @@ export class Executor {
     const started = Date.now();
     let accountId: string | undefined;
     let toolkitSlug: string | undefined;
+    let metered = false;
     try {
       if (!req.userId) throw badRequest('user_id is required');
       const { toolkit, action } = this.resolve(req.tool);
       toolkitSlug = toolkit.slug;
+      // Plan limits; calls refused here are not billed.
+      await this.usage?.admit(req.tenantId);
+      metered = true;
       const cred = await this.credential(toolkit, req.tenantId, req.userId, req.connectedAccountId);
       accountId = cred?.account.id;
       const data = await withTimeout(
@@ -143,11 +149,13 @@ export class Executor {
         duration_ms: Date.now() - started,
       };
       await this.audit(req, toolkitSlug, accountId, 'success', result.duration_ms);
+      await this.usage?.recordCall(req.tenantId, true);
       return result;
     } catch (e) {
       const error = describeError(e);
       const duration = Date.now() - started;
       await this.audit(req, toolkitSlug, accountId, 'error', duration, `${error.code}: ${error.message}`);
+      if (metered) await this.usage?.recordCall(req.tenantId, false);
       return { successful: false, error, connected_account_id: accountId, duration_ms: duration };
     }
   }

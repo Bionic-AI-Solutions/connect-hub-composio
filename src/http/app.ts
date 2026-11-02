@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import formbody from '@fastify/formbody';
 import rateLimit from '@fastify/rate-limit';
@@ -7,9 +10,15 @@ import type { Db } from '../db/index.js';
 import { Vault, constantTimeEqual } from '../crypto/vault.js';
 import { Registry } from '../catalog/registry.js';
 import { TenantService } from '../tenancy/tenants.js';
+import { UsageService, type Branding } from '../tenancy/usage.js';
 import { ConnectionService } from '../auth/connections.js';
 import { Executor } from '../execute/executor.js';
-import { McpService } from '../mcp/gateway.js';
+import { McpService, type McpBinding } from '../mcp/gateway.js';
+import { OidcClient } from '../oauth/oidc.js';
+import { McpOAuthServer } from '../oauth/server.js';
+import { registerOAuthRoutes, registerOAuthTenantApi } from '../oauth/routes.js';
+import { TriggerService } from '../triggers/service.js';
+import { registerHookEndpoint, registerTriggerApi } from './trigger-routes.js';
 import { connectPage, messagePage } from '../connect/pages.js';
 import { AppError, badRequest, unauthorized } from '../errors.js';
 import type { Toolkit } from '../catalog/types.js';
@@ -30,15 +39,22 @@ export interface Services {
   connections: ConnectionService;
   executor: Executor;
   mcp: McpService;
+  triggers: TriggerService;
+  oauth: McpOAuthServer;
+  usage: UsageService;
 }
 
 export function createServices(config: Config, db: Db, registry: Registry): Services {
+  if (!config.MASTER_KEYS) throw new Error('Master keys are not resolved (call resolveMasterKeys first)');
   const vault = new Vault(config.MASTER_KEYS);
   const tenants = new TenantService(db);
   const connections = new ConnectionService(db, vault, registry, config);
-  const executor = new Executor(db, registry, connections, config);
+  const usage = new UsageService(db);
+  const executor = new Executor(db, registry, connections, config, usage);
   const mcp = new McpService(db, registry, executor, connections, config.PUBLIC_URL);
-  return { config, db, vault, registry, tenants, connections, executor, mcp };
+  const triggers = new TriggerService(db, vault, registry, connections, config, usage);
+  const oauth = new McpOAuthServer(db, vault, config, new OidcClient(config));
+  return { config, db, vault, registry, tenants, connections, executor, mcp, triggers, oauth, usage };
 }
 
 function bearerToken(req: FastifyRequest): string | undefined {
@@ -136,6 +152,39 @@ export async function buildApp(
       return reply.status(201).send({ tenant, api_key: apiKey });
     });
     admin.get('/admin/tenants', async () => ({ items: await s.tenants.list() }));
+    admin.put<{ Params: { id: string }; Body: any }>('/admin/tenants/:id/limits', async (req) => {
+      if (!(await s.tenants.get(req.params.id))) throw new AppError(404, 'not_found', 'Tenant not found');
+      return s.usage.setLimits(req.params.id, req.body ?? {});
+    });
+    admin.get<{ Querystring: { period?: string; format?: string } }>('/admin/usage', async (req, reply) => {
+      const report = await s.usage.allTenants(req.query.period);
+      if (req.query.format !== 'csv') return report;
+      const cols = [
+        'tenant_id',
+        'name',
+        'tool_calls',
+        'failed_calls',
+        'trigger_events',
+        'monthly_tool_call_limit',
+        'rate_limit_per_minute',
+      ] as const;
+      const cell = (v: unknown) => {
+        const t = v === null || v === undefined ? '' : String(v);
+        // Quote, and defuse spreadsheet formulas in tenant-controlled names.
+        return `"${(/^[=+\-@]/.test(t) ? `'${t}` : t).replace(/"/g, '""')}"`;
+      };
+      const csv = [cols.join(','), ...report.items.map((r) => cols.map((c) => cell(r[c])).join(','))].join(
+        '\n',
+      );
+      return reply
+        .header('content-type', 'text/csv; charset=utf-8')
+        .header('content-disposition', `attachment; filename="usage-${report.period}.csv"`)
+        .send(csv + '\n');
+    });
+    admin.put<{ Params: { id: string }; Body: any }>('/admin/tenants/:id/sso', async (req) => {
+      if (!(await s.tenants.get(req.params.id))) throw new AppError(404, 'not_found', 'Tenant not found');
+      return s.oauth.setSsoPolicy(req.params.id, req.body ?? {});
+    });
     admin.post<{ Params: { id: string }; Body: { name?: string } }>(
       '/admin/tenants/:id/api-keys',
       async (req, reply) => {
@@ -147,6 +196,12 @@ export async function buildApp(
   });
 
   // ───────────────────────────── tenant API (/v1) ─────────────────────────────
+  // Each MCP server's own endpoint: sign in with OAuth (or use its chm_ tokens) at this URL.
+  const withUrl = <T extends { id: string }>(row: T) => ({
+    ...row,
+    url: `${s.config.PUBLIC_URL}/mcp/s/${row.id}`,
+  });
+
   app.register(async (v1) => {
     v1.addHook('onRequest', async (req) => {
       const t = bearerToken(req);
@@ -275,9 +330,11 @@ export async function buildApp(
 
     // MCP servers
     v1.post<{ Body: any }>('/v1/mcp-servers', async (req, reply) =>
-      reply.status(201).send(await s.mcp.createServer(req.tenantId!, req.body ?? ({} as any))),
+      reply.status(201).send(withUrl(await s.mcp.createServer(req.tenantId!, req.body ?? ({} as any)))),
     );
-    v1.get('/v1/mcp-servers', async (req) => ({ items: await s.mcp.listServers(req.tenantId!) }));
+    v1.get('/v1/mcp-servers', async (req) => ({
+      items: (await s.mcp.listServers(req.tenantId!)).map(withUrl),
+    }));
     v1.delete<{ Params: { id: string } }>('/v1/mcp-servers/:id', async (req, reply) => {
       await s.mcp.deleteServer(req.tenantId!, req.params.id);
       return reply.status(204).send();
@@ -291,6 +348,16 @@ export async function buildApp(
       await s.mcp.revokeToken(req.tenantId!, req.params.id);
       return reply.status(204).send();
     });
+
+    registerTriggerApi(v1, s.triggers);
+    registerOAuthTenantApi(v1, s.oauth);
+    v1.get<{ Querystring: { period?: string } }>('/v1/usage', async (req) =>
+      s.usage.report(req.tenantId!, req.query.period),
+    );
+    v1.get('/v1/settings/branding', async (req) => s.usage.branding(req.tenantId!));
+    v1.put<{ Body: any }>('/v1/settings/branding', async (req) =>
+      s.usage.setBranding(req.tenantId!, (req.body ?? {}) as Record<string, unknown>),
+    );
 
     // Audit
     v1.get<{ Querystring: { user_id?: string; limit?: string } }>('/v1/audit-logs', async (req) => {
@@ -315,6 +382,29 @@ export async function buildApp(
       .header('referrer-policy', 'no-referrer')
       .send(body);
 
+  // Admin dashboard: static files, strict CSP (no inline script/style), talks to /v1 with the tenant's API key.
+  const dashDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'dashboard');
+  const dashFiles: Record<string, [string, string]> = {
+    '/dashboard': ['index.html', 'text/html; charset=utf-8'],
+    '/dashboard/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+    '/dashboard/app.css': ['app.css', 'text/css; charset=utf-8'],
+  };
+  for (const [path, [file, type]] of Object.entries(dashFiles)) {
+    const body = readFileSync(join(dashDir, file), 'utf8');
+    app.get(path, async (_req, reply) =>
+      reply
+        .header('content-type', type)
+        .header(
+          'content-security-policy',
+          "default-src 'none'; script-src 'self'; style-src 'self'; img-src https: data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        )
+        .header('x-content-type-options', 'nosniff')
+        .header('referrer-policy', 'no-referrer')
+        .header('cache-control', 'no-cache')
+        .send(body),
+    );
+  }
+
   // Landing page: people who open the bare domain should see a working service, not a 404.
   app.get('/', async (_req, reply) =>
     html(
@@ -334,14 +424,19 @@ export async function buildApp(
     title: string,
     msg: string,
     isError = false,
+    branding: Branding = {},
   ) =>
     redirectUrl
       ? reply.redirect(withStatus(redirectUrl, params))
-      : html(reply, messagePage(title, msg, isError), isError ? 400 : 200);
+      : html(reply, messagePage(title, msg, isError, branding), isError ? 400 : 200);
 
   app.get<{ Params: { id: string }; Querystring: { sig?: string } }>('/connect/:id', async (req, reply) => {
     try {
-      const { toolkit, scheme } = await s.connections.openConnectRequest(req.params.id, req.query.sig ?? '');
+      const {
+        toolkit,
+        scheme,
+        req: cr,
+      } = await s.connections.openConnectRequest(req.params.id, req.query.sig ?? '');
       if (scheme.type === 'OAUTH2' && !scheme.fields.length) {
         return reply.redirect(await s.connections.authorizeUrl(req.params.id, req.query.sig ?? ''));
       }
@@ -351,6 +446,8 @@ export async function buildApp(
           toolkit,
           scheme,
           `/connect/${req.params.id}?sig=${encodeURIComponent(req.query.sig ?? '')}`,
+          undefined,
+          await s.usage.branding(cr.tenant_id),
         ),
       );
     } catch (e) {
@@ -382,6 +479,8 @@ export async function buildApp(
           { status: 'success', connected_account_id: account.id },
           'Connected',
           `${ctx.toolkit.name} is connected. You can close this window.`,
+          false,
+          await s.usage.branding(ctx.req.tenant_id),
         );
       } catch (e) {
         if (e instanceof AppError && e.statusCode < 500) {
@@ -392,6 +491,7 @@ export async function buildApp(
               ctx.scheme,
               `/connect/${req.params.id}?sig=${encodeURIComponent(sig)}`,
               e.message,
+              await s.usage.branding(ctx.req.tenant_id),
             ),
             400,
           );
@@ -424,6 +524,8 @@ export async function buildApp(
           { status: 'success', connected_account_id: account.id },
           'Connected',
           'Your account is connected. You can close this window.',
+          false,
+          await s.usage.branding(account.tenant_id),
         );
       } catch (e) {
         if (e instanceof AppError)
@@ -434,15 +536,7 @@ export async function buildApp(
   );
 
   // ───────────────────────────── MCP (streamable HTTP, stateless) ─────────────────────────────
-  const mcpHandler = async (req: FastifyRequest, reply: FastifyReply) => {
-    const t = bearerToken(req);
-    const binding = t ? await s.mcp.authenticate(t) : undefined;
-    if (!binding) {
-      return reply
-        .status(401)
-        .header('www-authenticate', 'Bearer')
-        .send({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
-    }
+  const serveMcp = async (binding: McpBinding, req: FastifyRequest, reply: FastifyReply) => {
     if (req.method !== 'POST') {
       return reply
         .status(405)
@@ -462,9 +556,54 @@ export async function buildApp(
     await server.connect(transport);
     await transport.handleRequest(req.raw, reply.raw, req.body);
   };
+  const unauthorizedMcp = (reply: FastifyReply, wwwAuthenticate: string) =>
+    reply
+      .status(401)
+      .header('www-authenticate', wwwAuthenticate)
+      .send({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+
+  // Token-per-user endpoint (chm_ tokens issued by the tenant).
+  const mcpHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+    const t = bearerToken(req);
+    const binding = t ? await s.mcp.authenticate(t) : undefined;
+    if (!binding) return unauthorizedMcp(reply, 'Bearer');
+    return serveMcp(binding, req, reply);
+  };
+
+  // Per-server endpoint: accepts the server's chm_ tokens or OAuth access tokens; advertises OAuth discovery.
+  const mcpServerHandler = async (
+    req: FastifyRequest<{ Params: { serverId: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const serverId = req.params.serverId;
+    const t = bearerToken(req);
+    let binding: McpBinding | undefined;
+    if (t?.startsWith('chm_')) {
+      const b = await s.mcp.authenticate(t);
+      binding = b && b.server.id === serverId ? b : undefined;
+    } else if (t) {
+      const o = await s.oauth.validateAccessToken(t, serverId);
+      binding = o ? await s.mcp.bindingFor(o.tenantId, o.userId, o.serverId) : undefined;
+    }
+    if (!binding) {
+      return unauthorizedMcp(
+        reply,
+        `Bearer realm="connect-hub", resource_metadata="${s.oauth.resourceMetadataUrl(serverId)}"${t ? ', error="invalid_token"' : ''}`,
+      );
+    }
+    return serveMcp(binding, req, reply);
+  };
+  app.post('/mcp/s/:serverId', mcpServerHandler);
+  app.get('/mcp/s/:serverId', mcpServerHandler);
+  app.delete('/mcp/s/:serverId', mcpServerHandler);
+
+  await registerOAuthRoutes(app, s);
+
   app.post('/mcp', mcpHandler);
   app.get('/mcp', mcpHandler);
   app.delete('/mcp', mcpHandler);
+
+  await registerHookEndpoint(app, s.triggers);
 
   return app;
 }

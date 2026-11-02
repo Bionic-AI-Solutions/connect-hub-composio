@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { setup } from './helpers.js';
+import { createServices } from '../src/http/app.js';
 
 type Ctx = Awaited<ReturnType<typeof setup>>;
 let ctx: Ctx | undefined;
@@ -116,10 +117,10 @@ describe('OAuth2 flow', () => {
 
     // Simulate the user revoking access at the provider.
     const { rows } = await ctx.services.db.query('SELECT id, credentials_enc FROM connected_accounts');
-    const value = ctx.services.vault.decrypt<any>(rows[0].credentials_enc);
+    const value = ctx.services.vault.decrypt<any>(rows[0].credentials_enc, ctx.tenant.id);
     await ctx.services.db.query(
       `UPDATE connected_accounts SET credentials_enc = $1, expires_at = now() WHERE id = $2`,
-      [ctx.services.vault.encrypt({ ...value, refresh_token: 'revoked' }), rows[0].id],
+      [ctx.services.vault.encrypt({ ...value, refresh_token: 'revoked' }, ctx.tenant.id), rows[0].id],
     );
     const r2 = (
       await ctx.app.inject({
@@ -135,6 +136,81 @@ describe('OAuth2 flow', () => {
       await ctx.app.inject({ method: 'GET', url: `/v1/connected-accounts/${rows[0].id}`, headers: ctx.auth })
     ).json();
     expect(acct.status).toBe('EXPIRED');
+  });
+
+  it('two replicas refreshing the same account at once make exactly one refresh call', async () => {
+    ctx = await setup({ withProvider: true });
+    await oauthConnect(ctx, 'u1');
+    await ctx.services.db.query(`UPDATE connected_accounts SET expires_at = now() - interval '1 minute'`);
+    ctx.provider!.state.refreshDelayMs = 300;
+    // A second "replica": separate services (own in-process caches) over the same database.
+    const replica = createServices(ctx.services.config, ctx.services.db, ctx.services.registry);
+    const run = (svc: typeof replica) =>
+      svc.executor.execute({ tenantId: ctx!.tenant.id, userId: 'u1', tool: 'mockapp.whoami' });
+    const [a, b] = await Promise.all([run(ctx.services), run(replica)]);
+    expect(a.successful).toBe(true);
+    expect(b.successful).toBe(true);
+    expect(ctx.provider!.state.refreshCount).toBe(1);
+    expect((a.data as any).token).toBe((b.data as any).token);
+    const acct = (
+      await ctx.app.inject({ method: 'GET', url: '/v1/connected-accounts?user_id=u1', headers: ctx.auth })
+    ).json().items[0];
+    expect(acct.status).toBe('ACTIVE');
+    expect(acct.refresh_lock_until).toBeUndefined();
+  });
+
+  it('keeps the account ACTIVE when a lease expires mid-refresh and another replica gets invalid_grant', async () => {
+    ctx = await setup({ withProvider: true });
+    await oauthConnect(ctx, 'u1');
+    await ctx.services.db.query(`UPDATE connected_accounts SET expires_at = now() - interval '1 minute'`);
+    // Replica A: lease shorter than its (slow) token request, simulating a stalled refresh that outlives the lease.
+    ctx.services.connections.leaseSeconds = 1;
+    ctx.provider!.state.refreshDelayMs = 1800;
+    const replica = createServices(ctx.services.config, ctx.services.db, ctx.services.registry);
+    const run = (svc: typeof replica) =>
+      svc.executor.execute({ tenantId: ctx!.tenant.id, userId: 'u1', tool: 'mockapp.whoami' });
+    const a = run(ctx.services);
+    await new Promise((r) => setTimeout(r, 1300)); // A's lease has expired; B takes over with the same refresh token
+    const b = await run(replica);
+    const first = await a;
+    expect(first.successful).toBe(true);
+    expect(b.error?.code ?? 'ok').not.toBe('connection_required');
+    const acct = (
+      await ctx.app.inject({ method: 'GET', url: '/v1/connected-accounts?user_id=u1', headers: ctx.auth })
+    ).json().items[0];
+    expect(acct.status).toBe('ACTIVE');
+    // The account keeps working afterwards.
+    ctx.provider!.state.refreshDelayMs = 0;
+    expect((await run(replica)).successful).toBe(true);
+  });
+
+  it('aborts a token request that hangs instead of holding the lease forever', async () => {
+    ctx = await setup({ withProvider: true });
+    await oauthConnect(ctx, 'u1');
+    await ctx.services.db.query(`UPDATE connected_accounts SET expires_at = now() - interval '1 minute'`);
+    ctx.services.connections.tokenTimeoutMs = 300;
+    ctx.provider!.state.refreshDelayMs = 3000;
+    const started = Date.now();
+    const r = await ctx.services.executor.execute({
+      tenantId: ctx.tenant.id,
+      userId: 'u1',
+      tool: 'mockapp.whoami',
+    });
+    expect(r.successful).toBe(false);
+    expect(Date.now() - started).toBeLessThan(2500);
+    const { rows } = await ctx.services.db.query('SELECT status, refresh_lock_until FROM connected_accounts');
+    expect(rows[0]).toMatchObject({ status: 'ACTIVE', refresh_lock_until: null });
+  });
+
+  it('sends JSON token requests to providers that document them (Atlassian)', async () => {
+    ctx = await setup({ withProvider: true, tokenFormat: 'json' });
+    const cb = await oauthConnect(ctx, 'u1');
+    expect(cb.statusCode).toBe(200);
+    expect(ctx.provider!.state.lastTokenContentType).toContain('application/json');
+    expect(ctx.provider!.state.lastTokenRequest).toMatchObject({
+      grant_type: 'authorization_code',
+      client_id: 'mock-client',
+    });
   });
 
   it('uses a tenant-supplied OAuth app over the platform app (white-label)', async () => {
@@ -167,6 +243,25 @@ describe('OAuth2 flow', () => {
     );
     expect(authorize.searchParams.get('client_id')).toBe('tenant-client');
     expect(authorize.searchParams.get('scope')).toBe('read write');
+  });
+
+  it('upgrades a pre-tenant (v1) OAuth app secret to the tenant-scoped format when it is used', async () => {
+    ctx = await setup({ withProvider: true });
+    await ctx.app.inject({
+      method: 'POST',
+      url: '/v1/auth-configs',
+      headers: ctx.auth,
+      payload: { toolkit: 'mockapp', client_id: 'mock-client', client_secret: 'mock-secret' },
+    });
+    // Simulate data written before tenant-scoped encryption existed.
+    await ctx.services.db.query('UPDATE auth_configs SET client_secret_enc = $1', [
+      ctx.services.vault.encrypt('mock-secret'),
+    ]);
+    const cb = await oauthConnect(ctx, 'u1');
+    expect(cb.statusCode).toBe(200);
+    const { rows } = await ctx.services.db.query('SELECT client_secret_enc FROM auth_configs');
+    expect(rows[0].client_secret_enc.startsWith('v2.')).toBe(true);
+    expect(ctx.services.vault.decrypt(rows[0].client_secret_enc, ctx.tenant.id)).toBe('mock-secret');
   });
 
   it('explains a missing OAuth app', async () => {

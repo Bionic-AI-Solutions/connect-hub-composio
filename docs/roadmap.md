@@ -33,27 +33,26 @@ constraint on selling the service.
 - Kubernetes deployment in the Deploy repo (Vault + ESO, shared Postgres, Kong, `/admin` blocked at the edge)
 - CI: tests and image publish to `docker4zerocool/connect-hub`; `scripts/hubctl.mjs` operator CLI
 
-## Next — internal use
+## Done (v0.3)
 
-1. **Self-service identity for Paperclip users**: act as an MCP OAuth authorization server (protected-resource
-   metadata, dynamic client registration) with Keycloak as the login, so each person authorizes Paperclip
-   without handling hub tokens. Paperclip already implements the client side of MCP OAuth.
-2. **Paperclip "Connect Hub" aggregator** (in the Paperclip fork): app list and account screens like the
-   Composio ones, backed by `/v1/connected-accounts`.
+- MCP OAuth: the hub is an OAuth 2.1 authorization server for its MCP endpoints, signing people in with Keycloak,
+  with a tenant sign-in policy and consent
+- Admin dashboard at `/dashboard`
+- Triggers: polling and per-account webhook triggers, signed delivery with retries
+- Atlassian OAuth 2.0 (3LO) toolkit for Jira and Confluence
+- Multi-replica safety: refresh lease; all background work claims rows with leases
+- Per-tenant encryption keys (HKDF + AAD); master keys can be held by Vault Transit
+- Per-tenant rate limits, monthly quotas, usage metering and billing export; tenant branding on hosted pages
+- Provider verification checklist (`docs/provider-verification.md`)
+- Paperclip Connect Hub aggregator (in the Paperclip fork)
 
-3. **Triggers**: run piece triggers (webhook + polling strategies) and deliver events to tenant webhooks, signed.
-4. **Admin dashboard**: toolkits, auth configs, connected accounts, MCP servers, audit log (Composio's dashboard).
-5. **Atlassian OAuth 2.0 (3LO)** native auth for Jira/Confluence so users connect without API tokens.
-6. **Multi-replica safety**: row lock around token refresh; move kv_store and audit writes to a queue.
-7. **Outbound proxy support** for `fetch`-based native tools (`NODE_USE_ENV_PROXY=1` works on Node 22.21+).
+## Next
 
-## Next — product
-
-1. **KMS-backed vault** (AWS KMS / GCP KMS / HashiCorp Vault transit) with per-tenant data keys.
-2. **Per-tenant quotas and rate limits**, usage metering per tool call, billing export.
-3. **SDKs** (TypeScript, Python) and OpenAPI spec; framework adapters (OpenAI/Anthropic tool formats, LangChain).
-4. **White-label connect page**: tenant logo, colours, custom domain.
-5. **Provider verification**: Google restricted-scope verification, Meta App Review, LinkedIn partner products for
-   the platform-managed apps.
-6. **Tenant roles** (admin vs. read-only keys), SSO for the dashboard, audit export, data residency options.
-7. **Piece update pipeline**: pin piece versions, run contract tests, then roll forward.
+1. **App-webhook triggers** (`APP_WEBHOOK`, e.g. Slack Events API): one central app subscription per provider, fanned
+   out to tenants.
+2. **SDKs** (TypeScript, Python) and an OpenAPI spec; framework adapters (OpenAI/Anthropic tool formats,
+   LangChain).
+3. **Custom domains** for the connect page per tenant (needs per-domain TLS and ingress).
+4. **Dashboard sign-in through SSO** (today: tenant API key); roles for read-only operators.
+5. **Piece update pipeline**: pin piece versions, run contract tests, then roll forward.
+6. **Data residency and audit export** for regulated clients.

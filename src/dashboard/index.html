@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Connect Hub</title>
+    <link rel="stylesheet" href="/dashboard/app.css" />
+    <script src="/dashboard/app.js" defer></script>
+  </head>
+  <body>
+    <div id="login" class="login" hidden>
+      <form id="login-form" class="card narrow">
+        <h1>Connect Hub</h1>
+        <p class="muted">
+          Sign in with your organization's API key (<code>chk_…</code>). It stays in this browser tab only.
+        </p>
+        <label for="api-key">API key</label>
+        <input id="api-key" type="password" autocomplete="off" required />
+        <p id="login-error" class="error" hidden></p>
+        <button type="submit">Sign in</button>
+      </form>
+    </div>
+    <div id="app" class="shell" hidden>
+      <aside class="side">
+        <div class="brand">Connect Hub</div>
+        <nav id="nav"></nav>
+        <button id="logout" class="ghost small">Sign out</button>
+      </aside>
+      <main id="view" class="main"></main>
+    </div>
+    <div id="toast" class="toast" hidden></div>
+  </body>
+</html>

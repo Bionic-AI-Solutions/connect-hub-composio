@@ -1,4 +1,5 @@
 import { loadConfig } from './config.js';
+import { resolveMasterKeys } from './crypto/kms.js';
 import { migrate, openDb } from './db/index.js';
 import { Registry } from './catalog/registry.js';
 import { buildApp, createServices } from './http/app.js';
@@ -8,6 +9,8 @@ async function main() {
   const db = await openDb(config.DATABASE_URL);
   await migrate(db);
   const registry = Registry.default();
+  // Unwrap master keys from Vault Transit when configured, before anything touches encrypted data.
+  config.MASTER_KEYS = await resolveMasterKeys(config);
   const services = createServices(config, db, registry);
   const app = await buildApp(services);
 
@@ -34,8 +37,27 @@ async function main() {
     sweep.unref();
   }
 
+  let triggerTimer: NodeJS.Timeout | undefined;
+  if (config.TRIGGER_TICK_SECONDS > 0) {
+    let running = false;
+    triggerTimer = setInterval(async () => {
+      if (running) return; // never overlap passes in one process; other replicas coordinate through row leases
+      running = true;
+      try {
+        const r = await services.triggers.tick();
+        if (r.polled || r.delivered || r.renewed) app.log.debug(r, 'trigger pass');
+      } catch (e) {
+        app.log.error(e, 'trigger pass failed');
+      } finally {
+        running = false;
+      }
+    }, config.TRIGGER_TICK_SECONDS * 1000);
+    triggerTimer.unref();
+  }
+
   const shutdown = async () => {
     clearInterval(sweep);
+    clearInterval(triggerTimer);
     await app.close();
     await db.close();
     process.exit(0);

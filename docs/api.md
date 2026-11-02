@@ -67,6 +67,60 @@ them too.
 an `isError` result containing the connect link; `elicitation` returns a JSON-RPC error `-32042`
 (URL elicitation required) with `data.elicitations[0] = {mode: "url", elicitationId, url, message}`.
 
+## MCP OAuth
+
+Each MCP server's own endpoint is `/mcp/s/:serverId`. It accepts that server's `chm_` tokens and OAuth access
+tokens (`cha_…`). Without a valid token it answers 401 with
+`WWW-Authenticate: Bearer resource_metadata="<PUBLIC_URL>/.well-known/oauth-protected-resource/mcp/s/:serverId"`.
+
+| Method  | Path                                                    | Notes                                                                                                               |
+| ------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| GET     | `/.well-known/oauth-protected-resource/mcp/s/:serverId` | RFC 9728                                                                                                            |
+| GET     | `/.well-known/oauth-authorization-server`               | RFC 8414                                                                                                            |
+| POST    | `/oauth2/register`                                      | RFC 7591 dynamic client registration (`token_endpoint_auth_method` none / client_secret_post / client_secret_basic) |
+| GET     | `/oauth2/authorize`                                     | code + PKCE S256 + `resource` (the server URL) required; sign-in through the OIDC provider, then consent            |
+| POST    | `/oauth2/token`                                         | `authorization_code` (with `code_verifier`) and `refresh_token` (rotating; replay revokes the grant)                |
+| POST    | `/oauth2/revoke`                                        | RFC 7009                                                                                                            |
+| GET/PUT | `/v1/settings/sso`                                      | `{allowed_domains: [...], allowed_emails: [...]}`: who may sign in for this tenant                                  |
+| GET     | `/v1/mcp-oauth-grants?user_id=`                         | active grants                                                                                                       |
+| DELETE  | `/v1/mcp-oauth-grants/:id`                              | revoke a grant                                                                                                      |
+| PUT     | `/admin/tenants/:id/sso`                                | operator sets a tenant's sign-in policy                                                                             |
+
+## Triggers
+
+| Method | Path                                          | Body / notes                                                                                                                                     |
+| ------ | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| GET    | `/v1/triggers?toolkit=a,b`                    | available triggers (`strategy`: POLLING or WEBHOOK)                                                                                              |
+| GET    | `/v1/triggers/:slug`                          | `input_schema`, `sample_data`                                                                                                                    |
+| POST   | `/v1/trigger-subscriptions`                   | `{trigger, user_id, webhook_url, config?, connected_account_id?, poll_interval_seconds?}` → `{subscription, signing_secret}` (secret shown once) |
+| GET    | `/v1/trigger-subscriptions?user_id=`          |                                                                                                                                                  |
+| GET    | `/v1/trigger-subscriptions/:id`               |                                                                                                                                                  |
+| GET    | `/v1/trigger-subscriptions/:id/events?limit=` | delivery status per event (payloads are not kept)                                                                                                |
+| DELETE | `/v1/trigger-subscriptions/:id`               | unregisters with the provider → `{provider_cleanup: "ok" \| "failed"}`                                                                           |
+
+Deliveries are `POST <webhook_url>` with JSON `{id, type: "trigger.event", subscription_id, trigger, toolkit, user_id,
+connected_account_id, created_at, data}` and headers `X-Hub-Event-Id`, `X-Hub-Timestamp` and
+`X-Hub-Signature-256: sha256=<hex HMAC-SHA256(secret, "<timestamp>.<raw body>")>`. Delivery is at least once:
+dedupe on the event id. A failed delivery is retried with exponential backoff, 6 attempts in all. `webhook_url`
+must be public https.
+
+Providers call `POST|GET /hooks/:subscriptionId/:token` (public; the token is secret).
+
+## Usage, limits and branding
+
+| Method  | Path                              | Notes                                                                     |
+| ------- | --------------------------------- | ------------------------------------------------------------------------- |
+| GET     | `/v1/usage?period=YYYY-MM`        | `{tool_calls, failed_calls, trigger_events, limits}`                      |
+| GET/PUT | `/v1/settings/branding`           | `{display_name, logo_url (https), accent_color (#rrggbb), support_email}` |
+| PUT     | `/admin/tenants/:id/limits`       | `{rate_limit_per_minute, monthly_tool_call_limit}` (null = unlimited)     |
+| GET     | `/admin/usage?period=&format=csv` | billing export across tenants                                             |
+
+Calls over a limit fail with `rate_limited` (with `retry_after_seconds`) or `quota_exceeded`, and are not billed.
+
+## Dashboard
+
+`/dashboard`: sign in with a tenant API key.
+
 ## Audit
 
 `GET /v1/audit-logs?user_id=&limit=` — one row per tool execution.

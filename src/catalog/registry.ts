@@ -1,10 +1,11 @@
 import { loadInstalledPieces } from './activepieces.js';
+import { atlassian } from './native/atlassian.js';
 import { cloudflare } from './native/cloudflare.js';
 import { googleAnalytics } from './native/google-analytics.js';
 import { stackexchange } from './native/stackexchange.js';
 import type { ToolDef, Toolkit } from './types.js';
 
-export const NATIVE_TOOLKITS: Toolkit[] = [stackexchange, cloudflare, googleAnalytics];
+export const NATIVE_TOOLKITS: Toolkit[] = [stackexchange, cloudflare, googleAnalytics, atlassian];
 
 export class Registry {
   private readonly toolkits = new Map<string, Toolkit>();

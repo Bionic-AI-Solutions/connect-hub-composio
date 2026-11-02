@@ -1,5 +1,19 @@
 import { z } from 'zod';
 
+/** https, or http to a loopback address (dev/tests) or, when allowed, a cluster-internal service name. */
+function secureOrInternal(raw: string, allowClusterInternal: boolean): boolean {
+  try {
+    const u = new URL(raw);
+    if (u.protocol === 'https:') return true;
+    if (u.protocol !== 'http:') return false;
+    const h = u.hostname;
+    if (['localhost', '127.0.0.1', '[::1]'].includes(h)) return true;
+    return allowClusterInternal && (h.endsWith('.svc') || h.endsWith('.svc.cluster.local'));
+  } catch {
+    return false;
+  }
+}
+
 const schema = z.object({
   PORT: z.coerce.number().int().default(3000),
   HOST: z.string().default('0.0.0.0'),
@@ -11,7 +25,25 @@ const schema = z.object({
    * Comma-separated `<keyId>:<base64 32-byte key>` list. The FIRST entry encrypts new data;
    * the rest stay valid for decryption so keys can be rotated without downtime.
    */
-  MASTER_KEYS: z.string().min(1, 'MASTER_KEYS is required (see .env.example)'),
+  MASTER_KEYS: z.string().optional(),
+  /**
+   * Alternative to MASTER_KEYS: `<keyId>:<vault transit ciphertext>[,…]`, unwrapped at startup through Vault Transit so
+   * the plaintext keys never sit in a Kubernetes secret. Requires VAULT_ADDR and VAULT_TOKEN or VAULT_K8S_ROLE.
+   */
+  MASTER_KEYS_WRAPPED: z.string().optional(),
+  VAULT_ADDR: z
+    .string()
+    .url()
+    .refine(
+      (u) => secureOrInternal(u, true),
+      'VAULT_ADDR must be https (http only for localhost or in-cluster *.svc)',
+    )
+    .optional(),
+  VAULT_TOKEN: z.string().optional(),
+  VAULT_K8S_ROLE: z.string().optional(),
+  VAULT_K8S_MOUNT: z.string().default('kubernetes'),
+  VAULT_TRANSIT_MOUNT: z.string().default('transit'),
+  VAULT_TRANSIT_KEY: z.string().default('connect-hub'),
   /** Bearer token for /admin endpoints (tenant provisioning). */
   ADMIN_TOKEN: z.string().min(24, 'ADMIN_TOKEN must be at least 24 characters'),
   CONNECT_LINK_TTL_MINUTES: z.coerce.number().int().positive().default(30),
@@ -20,6 +52,24 @@ const schema = z.object({
   /** Comma-separated origins that connect links may redirect back to. Empty = any https origin is refused. */
   ALLOWED_REDIRECT_ORIGINS: z.string().default(''),
   LOG_LEVEL: z.string().default('info'),
+  /** OIDC provider people sign in with for MCP OAuth (e.g. https://keycloak.example.com/realms/bionic). */
+  // The ID token is trusted because it comes straight from the issuer over TLS, so the issuer must be https.
+  OIDC_ISSUER: z
+    .string()
+    .url()
+    .refine((u) => secureOrInternal(u, false), 'OIDC_ISSUER must be https (http only for localhost)')
+    .optional(),
+  OIDC_CLIENT_ID: z.string().optional(),
+  OIDC_CLIENT_SECRET: z.string().optional(),
+  MCP_OAUTH_ACCESS_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+  MCP_OAUTH_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(30),
+  /** Seconds between trigger scheduler passes (polling, delivery, renewals). 0 disables the scheduler. */
+  TRIGGER_TICK_SECONDS: z.coerce.number().int().nonnegative().default(10),
+  /** Allow trigger webhooks to http/private addresses. Only for tests and trusted single-tenant setups. */
+  TRIGGER_ALLOW_PRIVATE_WEBHOOKS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 });
 
 export type Config = z.infer<typeof schema> & {
@@ -45,7 +95,16 @@ function readPlatformOAuthApps(env: NodeJS.ProcessEnv): Config['platformOAuthApp
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const parsed = schema.safeParse(env);
+  const parsed = schema
+    .refine((c) => c.MASTER_KEYS || c.MASTER_KEYS_WRAPPED, {
+      message: 'Set MASTER_KEYS, or MASTER_KEYS_WRAPPED with Vault settings (see .env.example)',
+      path: ['MASTER_KEYS'],
+    })
+    .refine((c) => !c.MASTER_KEYS_WRAPPED || (c.VAULT_ADDR && (c.VAULT_TOKEN || c.VAULT_K8S_ROLE)), {
+      message: 'MASTER_KEYS_WRAPPED needs VAULT_ADDR and VAULT_TOKEN or VAULT_K8S_ROLE',
+      path: ['MASTER_KEYS_WRAPPED'],
+    })
+    .safeParse(env);
   if (!parsed.success) {
     const msg = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('\n  ');
     throw new Error(`Invalid configuration:\n  ${msg}`);
