@@ -315,6 +315,18 @@ export async function buildApp(
       .header('referrer-policy', 'no-referrer')
       .send(body);
 
+  // Landing page: people who open the bare domain should see a working service, not a 404.
+  app.get('/', async (_req, reply) =>
+    html(
+      reply,
+      messagePage(
+        'Connect Hub',
+        'This service connects your apps (Google, GitHub, Slack, Jira and more) to the AI agents you work with. ' +
+          'You reach it through a connect link from your organization, so there is nothing to do here.',
+      ),
+    ),
+  );
+
   const finish = (
     reply: FastifyReply,
     redirectUrl: string | null,

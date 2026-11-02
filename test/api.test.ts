@@ -30,6 +30,14 @@ async function connectFake(c: Ctx, userId: string, key = 'good-key') {
 }
 
 describe('tenant API', () => {
+  it('serves a landing page at / instead of a 404', async () => {
+    ctx = await setup();
+    const r = await ctx.app.inject({ method: 'GET', url: '/' });
+    expect(r.statusCode).toBe(200);
+    expect(r.headers['content-type']).toContain('text/html');
+    expect(r.body).toContain('Connect Hub');
+  });
+
   it('requires a valid API key and admin token', async () => {
     ctx = await setup();
     expect((await ctx.app.inject({ method: 'GET', url: '/v1/toolkits' })).statusCode).toBe(401);
