@@ -293,6 +293,19 @@ export async function buildApp(
     });
 
     // Auth configs
+    // App picker and one-time OAuth setup per provider (the dashboard's Apps page).
+    v1.get<{ Querystring: { user_id?: string } }>('/v1/apps', async (req) => ({
+      items: await s.connections.appsOverview(req.tenantId!, req.query.user_id || undefined),
+    }));
+    v1.get('/v1/oauth-providers', async (req) => ({
+      items: await s.connections.oauthProviders(req.tenantId!),
+    }));
+    v1.put<{ Params: { provider: string }; Body: any }>('/v1/oauth-providers/:provider', async (req) =>
+      s.connections.setProviderApp(req.tenantId!, req.params.provider, req.body ?? {}),
+    );
+    v1.delete<{ Params: { provider: string } }>('/v1/oauth-providers/:provider', async (req) =>
+      s.connections.clearProviderApp(req.tenantId!, req.params.provider),
+    );
     v1.post<{ Body: any }>('/v1/auth-configs', async (req, reply) =>
       reply.status(201).send(await s.connections.createAuthConfig(req.tenantId!, req.body ?? ({} as any))),
     );

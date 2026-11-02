@@ -24,6 +24,20 @@ Tenant endpoints take `Authorization: Bearer chk_…` (or `x-api-key`). Errors a
 Execution error codes: `invalid_input`, `connection_required`, `account_not_active`, `provider_error`,
 `tool_timeout`, `execution_error`.
 
+## Apps and one-time sign-in setup
+
+The dashboard's Apps page uses these. Set an OAuth app up once per provider (Google covers Gmail, Drive, Sheets,
+YouTube…); everyone in the tenant then connects by signing in.
+
+| Method | Path                            | Body / query                 | Result                                                                                               |
+| ------ | ------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
+| GET    | `/v1/apps?user_id=`             |                              | per app: `connect` (`oauth` \| `form` \| `setup_required` \| `none`), `oauth_source`, account counts |
+| GET    | `/v1/oauth-providers`           |                              | per provider: console link, callback URL, scopes, apps, `source` (`tenant` \| `platform` \| `none`)  |
+| PUT    | `/v1/oauth-providers/:provider` | `{client_id, client_secret}` | one OAuth app for every app of that provider (secret encrypted, never returned)                      |
+| DELETE | `/v1/oauth-providers/:provider` |                              | removes the tenant's app; sign-in falls back to the platform app, if set                             |
+
+`redirect_url` on a connect link may always point back to the hub itself (the dashboard returns there after sign-in).
+
 ## Auth configs
 
 | Method | Path                        | Body                                                                                            |

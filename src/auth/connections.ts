@@ -5,6 +5,7 @@ import { newId, randomToken, type Vault } from '../crypto/vault.js';
 import type { Registry } from '../catalog/registry.js';
 import type { AuthScheme, AuthSchemeType, ConnectionValue, Toolkit } from '../catalog/types.js';
 import { AppError, badRequest, notFound } from '../errors.js';
+import { PROVIDER_SETUP } from '../catalog/providers.js';
 
 export type AccountStatus = 'ACTIVE' | 'EXPIRED' | 'FAILED';
 
@@ -176,6 +177,146 @@ export class ConnectionService {
     if (!rows.length) throw notFound('Auth config');
   }
 
+  // ───────────────────────────── one-time OAuth setup per provider ─────────────────────────────
+
+  /** Toolkits whose OAuth scheme belongs to this provider family (google covers Gmail, Drive, YouTube…). */
+  private providerToolkits(provider: string): Toolkit[] {
+    return this.registry
+      .listToolkits()
+      .filter((tk) => tk.authSchemes.some((s) => s.type === 'OAUTH2' && s.oauth2?.provider === provider));
+  }
+
+  /** Every OAuth provider the catalog uses, whether an OAuth app is set (platform-wide or this tenant's own). */
+  async oauthProviders(tenantId: string) {
+    const { rows } = await this.db.query<{
+      toolkit: string;
+      client_id: string | null;
+      use_platform_app: boolean;
+    }>(
+      `SELECT DISTINCT ON (toolkit) toolkit, client_id, use_platform_app FROM auth_configs
+        WHERE tenant_id = $1 AND scheme = 'OAUTH2' ORDER BY toolkit, created_at DESC`,
+      [tenantId],
+    );
+    const own = new Map(
+      rows.filter((r) => !r.use_platform_app && r.client_id).map((r) => [r.toolkit, r.client_id!]),
+    );
+    const providers = new Map<string, Toolkit[]>();
+    for (const tk of this.registry.listToolkits())
+      for (const s of tk.authSchemes)
+        if (s.type === 'OAUTH2' && s.oauth2)
+          providers.set(s.oauth2.provider, [...(providers.get(s.oauth2.provider) ?? []), tk]);
+    return [...providers.entries()]
+      .map(([provider, tks]) => {
+        const tenantClientIds = [...new Set(tks.map((tk) => own.get(tk.slug)).filter(Boolean))] as string[];
+        const setup = PROVIDER_SETUP[provider];
+        const scopes = [
+          ...new Set(
+            tks.flatMap((tk) => tk.authSchemes.find((s) => s.type === 'OAUTH2')?.oauth2?.scopes ?? []),
+          ),
+        ];
+        return {
+          provider,
+          name: setup?.name ?? provider,
+          console_url: setup?.consoleUrl ?? null,
+          note: setup?.note ?? null,
+          callback_url: this.redirectUri,
+          scopes,
+          toolkits: tks.map((tk) => ({ slug: tk.slug, name: tk.name })),
+          // Which OAuth app sign-in uses: the tenant's own (per app, newest wins) or the platform's.
+          source: tenantClientIds.length
+            ? 'tenant'
+            : this.config.platformOAuthApps[provider]
+              ? 'platform'
+              : 'none',
+          client_id: tenantClientIds.length === 1 ? tenantClientIds[0] : null,
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Store one OAuth app for every app of a provider, so a person only enters the keys once. */
+  async setProviderApp(
+    tenantId: string,
+    provider: string,
+    input: { client_id?: string; client_secret?: string },
+  ) {
+    const tks = this.providerToolkits(provider);
+    if (!tks.length) throw notFound(`OAuth provider "${provider}"`);
+    const clientId = typeof input.client_id === 'string' ? input.client_id.trim() : '';
+    const clientSecret = typeof input.client_secret === 'string' ? input.client_secret.trim() : '';
+    if (!clientId || !clientSecret) throw badRequest('client_id and client_secret are required');
+    if (clientId.length > 500 || clientSecret.length > 2000)
+      throw badRequest('client_id or client_secret is too long');
+    const ids: string[] = [];
+    // New rows first: sign-in always picks the newest config, so there is never a moment without one.
+    for (const tk of tks) {
+      const id = newId('ac');
+      ids.push(id);
+      await this.db.query(
+        `INSERT INTO auth_configs (id, tenant_id, toolkit, scheme, use_platform_app, client_id, client_secret_enc, scopes)
+         VALUES ($1,$2,$3,'OAUTH2',false,$4,$5,NULL)`,
+        [id, tenantId, tk.slug, clientId, this.vault.encrypt(clientSecret, tenantId)],
+      );
+    }
+    await this.db.query(
+      `DELETE FROM auth_configs WHERE tenant_id = $1 AND scheme = 'OAUTH2' AND toolkit = ANY($2::text[]) AND NOT (id = ANY($3::text[]))`,
+      [tenantId, tks.map((tk) => tk.slug), ids],
+    );
+    return (await this.oauthProviders(tenantId)).find((p) => p.provider === provider)!;
+  }
+
+  /** Remove this tenant's own OAuth app for a provider; sign-in falls back to the platform app, if any. */
+  async clearProviderApp(tenantId: string, provider: string) {
+    const tks = this.providerToolkits(provider);
+    if (!tks.length) throw notFound(`OAuth provider "${provider}"`);
+    await this.db.query(
+      `DELETE FROM auth_configs WHERE tenant_id = $1 AND scheme = 'OAUTH2' AND toolkit = ANY($2::text[])`,
+      [tenantId, tks.map((tk) => tk.slug)],
+    );
+    return (await this.oauthProviders(tenantId)).find((p) => p.provider === provider)!;
+  }
+
+  /** The app picker: every toolkit with whether it can be connected now and this person's accounts. */
+  async appsOverview(tenantId: string, userId?: string) {
+    const providers = new Map((await this.oauthProviders(tenantId)).map((p) => [p.provider, p]));
+    const { rows } = await this.db.query<{ toolkit: string; status: string; n: string }>(
+      `SELECT toolkit, status, count(*)::text AS n FROM connected_accounts
+        WHERE tenant_id = $1 AND ($2::text IS NULL OR user_id = $2) GROUP BY toolkit, status`,
+      [tenantId, userId ?? null],
+    );
+    const counts = new Map<string, Record<string, number>>();
+    for (const r of rows)
+      counts.set(r.toolkit, { ...(counts.get(r.toolkit) ?? {}), [r.status]: Number(r.n) });
+    return this.registry.listToolkits().map((tk) => {
+      const oauth = tk.authSchemes.find((s) => s.type === 'OAUTH2')?.oauth2;
+      const provider = oauth ? providers.get(oauth.provider) : undefined;
+      const other = tk.authSchemes
+        .filter((s) => s.type !== 'OAUTH2' && s.type !== 'NO_AUTH')
+        .map((s) => s.type);
+      const oauthReady = !!provider && provider.source !== 'none';
+      const c = counts.get(tk.slug) ?? {};
+      return {
+        slug: tk.slug,
+        name: tk.name,
+        logo_url: tk.logoUrl ?? null,
+        categories: tk.categories,
+        tool_count: tk.tools.length,
+        // How "Connect" signs in: the provider's sign-in page, a form (API key, token…), or nothing at all.
+        connect: oauthReady
+          ? 'oauth'
+          : other.length
+            ? 'form'
+            : tk.authSchemes.some((s) => s.type === 'NO_AUTH')
+              ? 'none'
+              : 'setup_required',
+        oauth_provider: oauth?.provider ?? null,
+        oauth_source: provider?.source ?? null,
+        other_schemes: other,
+        accounts: { active: c.ACTIVE ?? 0, needs_attention: (c.EXPIRED ?? 0) + (c.FAILED ?? 0) },
+      };
+    });
+  }
+
   private async oauthClient(tenantId: string, tk: Toolkit, scheme: AuthScheme, authConfigId?: string | null) {
     let cfg: AuthConfigRow | undefined;
     if (authConfigId) {
@@ -216,7 +357,7 @@ export class ConnectionService {
       throw new AppError(
         409,
         'oauth_app_missing',
-        `No OAuth app for "${tk.slug}". Create an auth config with your own client_id/client_secret, or set OAUTH_${scheme.oauth2!.provider.toUpperCase().replace(/-/g, '_')}_CLIENT_ID/SECRET for a platform-managed app.`,
+        `${tk.name} sign-in is not set up yet. An admin sets it up once in the Connect Hub dashboard (Apps → ${tk.name} → Set up), or the operator sets OAUTH_${scheme.oauth2!.provider.toUpperCase().replace(/-/g, '_')}_CLIENT_ID/SECRET for every tenant.`,
       );
     }
     return {
@@ -238,7 +379,8 @@ export class ConnectionService {
       throw badRequest('redirect_url is not a valid URL');
     }
     const isLocal = u.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(u.hostname);
-    if (!isLocal && !this.config.allowedRedirectOrigins.includes(u.origin)) {
+    const isHub = u.origin === new URL(this.config.PUBLIC_URL).origin;
+    if (!isLocal && !isHub && !this.config.allowedRedirectOrigins.includes(u.origin)) {
       throw badRequest(`redirect_url origin ${u.origin} is not in ALLOWED_REDIRECT_ORIGINS`);
     }
   }
