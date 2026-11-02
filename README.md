@@ -5,22 +5,24 @@ and one API — REST or MCP — for your agents to act in those apps on their be
 Composio's toolkits, auth configs, connected accounts, hosted connect and MCP servers, built on permissively
 licensed parts so it can be run internally now and sold as a product later.
 
-Out of the box: **26 toolkits, 953 tools** — GitHub, Gmail, Google Drive/Sheets/Docs/Slides/Forms/Calendar/
-Contacts/Tasks/Search Console/My Business, YouTube, Google Analytics, Jira, Confluence, Slack, LinkedIn, Facebook
+Out of the box: **27 toolkits, 970 tools, 55 triggers**. The toolkits: GitHub, Gmail, Google Drive/Sheets/Docs/Slides/Forms/Calendar/
+Contacts/Tasks/Search Console/My Business, YouTube, Google Analytics, Jira, Confluence (API token or Atlassian sign-in), Slack, LinkedIn, Facebook
 Pages, Instagram Business, Reddit, Stack Overflow / Stack Exchange, Apify, Todoist, Zoom, Cloudflare.
 About 750 more apps are one command away (`npm run catalog:add -- hubspot notion …`).
 
 ## How it maps to Composio
 
-| Composio                                     | Connect Hub                                                                   |
-| -------------------------------------------- | ----------------------------------------------------------------------------- |
-| Toolkits & tools                             | `GET /v1/toolkits`, `GET /v1/tools` — Activepieces pieces + native toolkits   |
-| Auth configs (managed or your own OAuth app) | `POST /v1/auth-configs`; platform apps via `OAUTH_<PROVIDER>_*` env           |
-| Connected accounts per `user_id`             | `/v1/connected-accounts` — encrypted at rest, auto token refresh              |
-| Connect link / hosted auth page              | `POST /v1/connected-accounts/link` → `connect_url`                            |
-| Execute a tool                               | `POST /v1/tools/{slug}/execute`                                               |
-| MCP servers / Tool Router                    | `POST /v1/mcp-servers` (`direct` or `router` mode) + per-user tokens → `/mcp` |
-| Triggers                                     | Not yet — see [docs/roadmap.md](docs/roadmap.md)                              |
+| Composio                                     | Connect Hub                                                                                                     |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Toolkits & tools                             | `GET /v1/toolkits`, `GET /v1/tools` — Activepieces pieces + native toolkits                                     |
+| Auth configs (managed or your own OAuth app) | `POST /v1/auth-configs`; platform apps via `OAUTH_<PROVIDER>_*` env                                             |
+| Connected accounts per `user_id`             | `/v1/connected-accounts` — encrypted at rest, auto token refresh                                                |
+| Connect link / hosted auth page              | `POST /v1/connected-accounts/link` → `connect_url`                                                              |
+| Execute a tool                               | `POST /v1/tools/{slug}/execute`                                                                                 |
+| MCP servers / Tool Router                    | `POST /v1/mcp-servers` (`direct`/`router`); per-server URL with MCP OAuth (Keycloak sign-in) or per-user tokens |
+| Triggers                                     | `POST /v1/trigger-subscriptions`: polling and webhook triggers, HMAC-signed delivery to your webhook            |
+| Dashboard                                    | `/dashboard`: apps, accounts, MCP servers, triggers, OAuth apps, settings, usage, audit                         |
+| Usage limits & metering                      | per-tenant rate limits and monthly quotas; `GET /v1/usage`, billing export                                      |
 
 ## Quick start
 

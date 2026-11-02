@@ -54,8 +54,25 @@ Tool slugs are `<toolkit>.<action>` (e.g. `github.github_create_issue`); MCP nam
 - **Validation**: non-OAuth credentials are checked against the provider (piece `validate` hooks) before they are
   stored.
 - **Refresh**: tokens expiring within 5 minutes are refreshed before a tool runs; a background sweep refreshes
-  tokens expiring within 15 minutes. `invalid_grant` marks the account `EXPIRED` so the agent asks the user to
+  tokens expiring within 15 minutes. A refresh takes a 30-second lease on the account row, so only one replica spends a (possibly single-use)
+  refresh token; the others wait and read the stored result. `invalid_grant` marks the account `EXPIRED` so the agent asks the user to
   reconnect instead of retrying forever.
+
+## MCP OAuth
+
+The hub is an OAuth 2.1 authorization server for its own MCP endpoints (`src/oauth/`). Each MCP server config is a
+resource at `/mcp/s/:serverId`. A client discovers the hub from the 401's `resource_metadata`, registers itself
+(RFC 7591) and sends the person to `/oauth2/authorize`. The hub signs the person in through the OIDC provider
+(Keycloak, authorization code + PKCE + nonce) and checks the server's tenant policy (allowed email domains or
+addresses). After consent it issues a single-use code, exchanged with PKCE for an access token bound to tenant,
+user (email) and server, plus a rotating refresh token. Replaying a used refresh token revokes the whole grant.
+
+## Triggers
+
+`src/triggers/service.ts`. Polling triggers run on an interval; webhook triggers register
+`/hooks/:id/:token` with the provider. Events land in an encrypted outbox (`trigger_events`) and are delivered to
+the tenant's webhook, signed with HMAC-SHA256 over `<timestamp>.<body>` and retried with backoff. The scheduler
+runs on every replica; polling, renewals and deliveries claim rows with leases (`UPDATE … SKIP LOCKED`).
 
 ## Data model
 
@@ -66,7 +83,9 @@ Every query is scoped by `tenant_id`.
 
 ## Security model
 
-- Credentials and OAuth client secrets are encrypted with AES-256-GCM; the key id is bound as AAD. `MASTER_KEYS`
+- Tenant data is encrypted with AES-256-GCM under a per-tenant key derived (HKDF) from the master key, with
+  `<keyId>|<tenantId>` as AAD (v2 envelopes; older v1 envelopes still decrypt and are re-encrypted on use). Master
+  keys come from `MASTER_KEYS` or are unwrapped from Vault Transit at startup (`MASTER_KEYS_WRAPPED`). `MASTER_KEYS`
   holds the active key plus retired keys; envelopes under a retired key are re-encrypted on next use. Replace
   `Vault` with a KMS-backed class for production key custody.
 - API keys and MCP tokens are random 192-bit secrets stored as sha256 hashes, compared in constant time, revocable.
@@ -76,11 +95,11 @@ Every query is scoped by `tenant_id`.
 - API responses never include credentials; logs redact `Authorization` headers.
 - An MCP token is bound to one tenant, one server config and one end user; tools outside the config are refused.
 
-## Known limits (MVP)
+## Known limits
 
-- Token refresh is de-duplicated per process only; with several replicas, add a row lock (`SELECT … FOR UPDATE
-SKIP LOCKED`) around refresh.
-- Activepieces triggers (webhooks/polling) are not wired up yet; only actions are exposed.
+- `APP_WEBHOOK` triggers (one central subscription per provider app) are not supported yet.
 - Actions that pause runs or depend on Activepieces server endpoints (waitpoints, resume URLs) fail with a clear
   error.
 - `files.write` returns a `data:` URL; large file outputs should go to object storage.
+- The per-minute rate limit uses fixed one-minute windows, so bursts can reach up to twice the limit across a
+  window boundary.
