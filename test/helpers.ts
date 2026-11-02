@@ -15,6 +15,7 @@ export async function startMockProvider() {
   const state = {
     issued: 0,
     lastTokenRequest: null as Record<string, string> | null,
+    lastTokenContentType: '',
     challenges: new Map<string, string>(),
     validTokens: new Set<string>(),
     /** Refresh tokens rotate: each works once, like Atlassian's and many others. */
@@ -27,6 +28,7 @@ export async function startMockProvider() {
   app.post<{ Body: Record<string, string> }>('/token', async (req, reply) => {
     const b = req.body;
     state.lastTokenRequest = b;
+    state.lastTokenContentType = String(req.headers['content-type'] ?? '');
     if (b.client_id !== 'mock-client' || b.client_secret !== 'mock-secret')
       return reply.status(401).send({ error: 'invalid_client' });
     if (b.grant_type === 'authorization_code') {
@@ -76,7 +78,7 @@ export async function startMockProvider() {
   };
 }
 
-export function mockOAuthToolkit(base: string) {
+export function mockOAuthToolkit(base: string, opts: { tokenFormat?: 'form' | 'json' } = {}) {
   return defineToolkit({
     slug: 'mockapp',
     name: 'Mock App',
@@ -95,6 +97,7 @@ export function mockOAuthToolkit(base: string) {
           pkceMethod: 'S256',
           authorizeParams: {},
           clientAuth: 'body',
+          tokenFormat: opts.tokenFormat,
           provider: 'mockapp',
         },
       },
@@ -151,7 +154,7 @@ export const fakePiece: ApPiece = {
   }),
 };
 
-export async function setup(opts: { withProvider?: boolean } = {}) {
+export async function setup(opts: { withProvider?: boolean; tokenFormat?: 'form' | 'json' } = {}) {
   const provider = opts.withProvider ? await startMockProvider() : undefined;
   const config: Config = loadConfig({
     DATABASE_URL: 'pglite:memory',
@@ -166,7 +169,7 @@ export async function setup(opts: { withProvider?: boolean } = {}) {
   const db = await openDb(config.DATABASE_URL);
   await migrate(db);
   const toolkits = [...NATIVE_TOOLKITS, pieceToToolkit('fake', fakePiece, '1.0.0')];
-  if (provider) toolkits.push(mockOAuthToolkit(provider.base));
+  if (provider) toolkits.push(mockOAuthToolkit(provider.base, { tokenFormat: opts.tokenFormat }));
   const services: Services = createServices(config, db, new Registry(toolkits));
   const app = await buildApp(services, { logger: false });
   const res = await app.inject({

@@ -27,6 +27,8 @@ export interface OAuth2Spec {
   authorizeParams: Record<string, string>;
   /** How client credentials are sent to the token endpoint. */
   clientAuth: 'body' | 'header';
+  /** Token endpoint body encoding. Most providers take form-encoded; Atlassian documents JSON. */
+  tokenFormat?: 'form' | 'json';
   /** Provider family used to look up platform-managed OAuth apps (google, github, facebook…). */
   provider: string;
 }

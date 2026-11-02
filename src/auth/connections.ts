@@ -342,19 +342,21 @@ export class ConnectionService {
     tokenUrl: string,
     params: Record<string, string>,
     client: { clientId: string; clientSecret: string },
-    clientAuth: 'body' | 'header',
+    spec: { clientAuth: 'body' | 'header'; tokenFormat?: 'form' | 'json' },
   ): Promise<Record<string, any>> {
+    const json = spec.tokenFormat === 'json';
     const headers: Record<string, string> = {
-      'content-type': 'application/x-www-form-urlencoded',
+      'content-type': json ? 'application/json' : 'application/x-www-form-urlencoded',
       accept: 'application/json',
     };
-    const body = new URLSearchParams(params);
-    if (clientAuth === 'header') {
+    const fields: Record<string, string> = { ...params };
+    if (spec.clientAuth === 'header') {
       headers.authorization = `Basic ${Buffer.from(`${client.clientId}:${client.clientSecret}`).toString('base64')}`;
     } else {
-      body.set('client_id', client.clientId);
-      body.set('client_secret', client.clientSecret);
+      fields.client_id = client.clientId;
+      fields.client_secret = client.clientSecret;
     }
+    const body = json ? JSON.stringify(fields) : new URLSearchParams(fields);
     const res = await fetch(tokenUrl, { method: 'POST', headers, body });
     const text = await res.text();
     let data: Record<string, any>;
@@ -393,7 +395,7 @@ export class ConnectionService {
       redirect_uri: this.redirectUri,
     };
     if (o.pkce) params.code_verifier = secret.codeVerifier;
-    const data = await this.tokenRequest(tokenUrl, params, client, o.clientAuth);
+    const data = await this.tokenRequest(tokenUrl, params, client, o);
     const accessToken = data.access_token ?? data.authed_user?.access_token;
     if (!accessToken) throw new AppError(502, 'oauth_token_error', 'Token response had no access_token');
     const value: ConnectionValue = {
@@ -709,7 +711,7 @@ export class ConnectionService {
         value.token_url,
         { grant_type: 'refresh_token', refresh_token: value.refresh_token },
         { clientId: value.client_id, clientSecret: value.client_secret },
-        scheme.oauth2!.clientAuth,
+        scheme.oauth2!,
       );
       const next: ConnectionValue = {
         ...value,

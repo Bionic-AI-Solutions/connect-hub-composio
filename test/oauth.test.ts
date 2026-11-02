@@ -159,6 +159,17 @@ describe('OAuth2 flow', () => {
     expect(acct.refresh_lock_until).toBeUndefined();
   });
 
+  it('sends JSON token requests to providers that document them (Atlassian)', async () => {
+    ctx = await setup({ withProvider: true, tokenFormat: 'json' });
+    const cb = await oauthConnect(ctx, 'u1');
+    expect(cb.statusCode).toBe(200);
+    expect(ctx.provider!.state.lastTokenContentType).toContain('application/json');
+    expect(ctx.provider!.state.lastTokenRequest).toMatchObject({
+      grant_type: 'authorization_code',
+      client_id: 'mock-client',
+    });
+  });
+
   it('uses a tenant-supplied OAuth app over the platform app (white-label)', async () => {
     ctx = await setup({ withProvider: true });
     const cfg = await ctx.app.inject({
