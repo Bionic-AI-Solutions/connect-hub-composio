@@ -147,8 +147,11 @@ export class McpOAuthServer {
         `token_endpoint_auth_method must be one of ${AUTH_METHODS.join(', ')}`,
       );
     }
-    const grantTypes: string[] = body.grant_types ?? ['authorization_code', 'refresh_token'];
-    const responseTypes: string[] = body.response_types ?? ['code'];
+    const grantTypes: unknown = body.grant_types ?? ['authorization_code', 'refresh_token'];
+    const responseTypes: unknown = body.response_types ?? ['code'];
+    if (!Array.isArray(grantTypes) || !Array.isArray(responseTypes)) {
+      throw new OAuthError(400, 'invalid_client_metadata', 'grant_types and response_types must be arrays');
+    }
     if (
       !grantTypes.every((g) => ['authorization_code', 'refresh_token'].includes(g)) ||
       !grantTypes.includes('authorization_code')
@@ -203,8 +206,13 @@ export class McpOAuthServer {
     if (authorization?.startsWith('Basic ')) {
       const decoded = Buffer.from(authorization.slice(6), 'base64').toString('utf8');
       const i = decoded.indexOf(':');
-      clientId = decodeURIComponent(decoded.slice(0, i));
-      secret = decodeURIComponent(decoded.slice(i + 1));
+      if (i < 0) throw new OAuthError(401, 'invalid_client', 'Malformed Basic credentials');
+      try {
+        clientId = decodeURIComponent(decoded.slice(0, i));
+        secret = decodeURIComponent(decoded.slice(i + 1));
+      } catch {
+        throw new OAuthError(401, 'invalid_client', 'Malformed Basic credentials');
+      }
     }
     const c = await this.client(clientId);
     if (!c) throw new OAuthError(401, 'invalid_client', 'Unknown client');
@@ -225,7 +233,7 @@ export class McpOAuthServer {
   async authorize(
     q: Record<string, string | undefined>,
     resolveServer: (serverId: string) => Promise<{ tenantId: string } | undefined>,
-  ): Promise<string> {
+  ): Promise<{ location: string; browserNonce?: string }> {
     const c = await this.client(q.client_id);
     if (!c) throw new AppError(400, 'invalid_client', 'Unknown OAuth client. Register the client first.');
     if (!q.redirect_uri || !c.redirect_uris.includes(q.redirect_uri)) {
@@ -237,7 +245,7 @@ export class McpOAuthServer {
       u.searchParams.set('error_description', description);
       if (q.state) u.searchParams.set('state', q.state);
       u.searchParams.set('iss', this.issuer);
-      return u.toString();
+      return { location: u.toString() };
     };
     if (q.response_type !== 'code')
       return back('unsupported_response_type', 'Only response_type=code is supported');
@@ -256,9 +264,12 @@ export class McpOAuthServer {
 
     const id = newId('oar');
     const oidcSecret = { verifier: randomToken(48), nonce: randomToken(24) };
+    // The browser that starts the flow gets a cookie; sign-in and consent only continue in that same browser, so a
+    // signed-in victim cannot be walked through a request someone else started (authorization-request forgery).
+    const browserNonce = randomToken(24);
     await this.db.query(
       `INSERT INTO oauth_requests (id, client_id, redirect_uri, state, code_challenge, scope, resource, tenant_id, server_id,
-         oidc_secret_enc, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+         oidc_secret_enc, expires_at, browser_nonce_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [
         id,
         c.client_id,
@@ -271,13 +282,25 @@ export class McpOAuthServer {
         serverId,
         this.vault.encrypt(oidcSecret, server.tenantId),
         new Date(Date.now() + REQUEST_TTL_MS),
+        sha256(browserNonce),
       ],
     );
-    return this.oidc.authorizeUrl(
+    const location = await this.oidc.authorizeUrl(
       `${id}.${this.vault.sign(`oidc:${id}`)}`,
       oidcSecret.nonce,
       oidcSecret.verifier,
     );
+    return { location, browserNonce };
+  }
+
+  private checkBrowser(r: RequestRow & { browser_nonce_hash?: string | null }, browserNonce?: string) {
+    if (!r.browser_nonce_hash || !browserNonce || !safeEq(sha256(browserNonce), r.browser_nonce_hash)) {
+      throw new AppError(
+        403,
+        'browser_mismatch',
+        'This sign-in was started in a different browser. Start again from the app you are connecting.',
+      );
+    }
   }
 
   private async openRequest(id: string): Promise<RequestRow> {
@@ -305,11 +328,12 @@ export class McpOAuthServer {
   }
 
   /** OIDC callback: verify the sign-in and the tenant policy, then return what the consent page shows. */
-  async completeSignIn(state: string, code: string) {
+  async completeSignIn(state: string, code: string, browserNonce?: string) {
     const [id, sig] = String(state ?? '').split('.');
     if (!id || !sig || !this.vault.verify(`oidc:${id}`, sig))
       throw new AppError(403, 'invalid_state', 'Invalid sign-in state');
     const r = await this.openRequest(id);
+    this.checkBrowser(r, browserNonce);
     const secret = this.vault.decrypt<{ verifier: string; nonce: string }>(r.oidc_secret_enc, r.tenant_id);
     const who: OidcIdentity = await this.oidc.exchange(code, secret.verifier, secret.nonce);
     if (!(await this.policyAllows(r.tenant_id, who.email))) {
@@ -337,15 +361,24 @@ export class McpOAuthServer {
   }
 
   /** Consent decision → redirect back to the client with a code (or access_denied). */
-  async decide(requestId: string, consentToken: string, allow: boolean): Promise<string> {
+  async decide(
+    requestId: string,
+    consentToken: string,
+    allow: boolean,
+    browserNonce?: string,
+  ): Promise<string> {
     const r = await this.openRequest(requestId);
+    this.checkBrowser(r, browserNonce);
     if (!r.user_id || !this.vault.verify(`consent:${requestId}:${r.user_id}`, consentToken ?? '')) {
       throw new AppError(403, 'invalid_consent', 'Invalid consent form');
     }
-    await this.db.query(
-      'UPDATE oauth_requests SET completed_at = now(), oidc_secret_enc = $2 WHERE id = $1',
-      [requestId, ''],
+    // Atomic: two concurrent consent submissions cannot both mint a code.
+    const claimed = await this.db.query(
+      `UPDATE oauth_requests SET completed_at = now(), oidc_secret_enc = '' WHERE id = $1 AND completed_at IS NULL RETURNING id`,
+      [requestId],
     );
+    if (!claimed.rows.length)
+      throw new AppError(410, 'request_used', 'This sign-in request was already completed');
     const u = new URL(r.redirect_uri);
     if (r.state) u.searchParams.set('state', r.state);
     u.searchParams.set('iss', this.issuer);
@@ -424,14 +457,24 @@ export class McpOAuthServer {
       if (!body.code || !body.code_verifier || !body.redirect_uri) {
         throw new OAuthError(400, 'invalid_request', 'code, code_verifier and redirect_uri are required');
       }
-      // Single use: mark used atomically and act only if this request was the one that did it.
-      const row = (
-        await this.db.query(
-          `UPDATE oauth_codes SET used_at = now() WHERE code_hash = $1 AND used_at IS NULL RETURNING *`,
-          [sha256(String(body.code))],
-        )
-      ).rows[0];
-      if (!row) throw new OAuthError(400, 'invalid_grant', 'Authorization code is invalid or already used');
+      const codeHash = sha256(String(body.code));
+      const row = (await this.db.query('SELECT * FROM oauth_codes WHERE code_hash = $1', [codeHash])).rows[0];
+      if (!row) throw new OAuthError(400, 'invalid_grant', 'Authorization code is invalid');
+      if (row.used_at) {
+        // Replayed code: revoke whatever it produced (OAuth 2.1 §4.1.2).
+        if (row.issued_family_id) {
+          await this.db.query(
+            'UPDATE oauth_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL',
+            [row.issued_family_id],
+          );
+        }
+        throw new OAuthError(
+          400,
+          'invalid_grant',
+          'Authorization code was already used; its tokens are revoked',
+        );
+      }
+      // Validate everything before burning the code, so someone who only saw the code cannot invalidate it.
       if (row.client_id !== c.client_id || row.redirect_uri !== body.redirect_uri) {
         throw new OAuthError(
           400,
@@ -447,12 +490,21 @@ export class McpOAuthServer {
       if (body.resource && String(body.resource).replace(/\/+$/, '') !== row.resource) {
         throw new OAuthError(400, 'invalid_target', 'resource does not match the authorization');
       }
+      // Single use: burn atomically; only the request that burns it gets tokens.
+      const familyId = newId('fam');
+      const burned = await this.db.query(
+        `UPDATE oauth_codes SET used_at = now(), issued_family_id = $2 WHERE code_hash = $1 AND used_at IS NULL RETURNING code_hash`,
+        [codeHash, familyId],
+      );
+      if (!burned.rows.length)
+        throw new OAuthError(400, 'invalid_grant', 'Authorization code was already used');
       return this.issue({
         clientId: c.client_id,
         tenantId: row.tenant_id,
         serverId: row.server_id,
         userId: row.user_id,
         resource: row.resource,
+        familyId,
       });
     }
     if (body.grant_type === 'refresh_token') {
@@ -477,6 +529,14 @@ export class McpOAuthServer {
       }
       if (new Date(row.expires_at).getTime() < Date.now())
         throw new OAuthError(400, 'invalid_grant', 'Refresh token expired');
+      // The tenant's sign-in policy applies for the life of the grant, not only at sign-in.
+      if (!(await this.policyAllows(row.tenant_id, row.user_id))) {
+        await this.db.query(
+          'UPDATE oauth_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL',
+          [row.family_id],
+        );
+        throw new OAuthError(400, 'invalid_grant', 'This account is no longer allowed by the organization');
+      }
       const claimed = (
         await this.db.query(
           `UPDATE oauth_tokens SET used_at = now() WHERE id = $1 AND used_at IS NULL RETURNING id`,
@@ -538,6 +598,8 @@ export class McpOAuthServer {
       row.server_id !== serverId
     )
       return undefined;
+    // Policy changes (a removed domain or person) take effect immediately, not only at the next refresh.
+    if (!(await this.policyAllows(row.tenant_id, row.user_id))) return undefined;
     return { tenantId: row.tenant_id, userId: row.user_id, serverId: row.server_id };
   }
 

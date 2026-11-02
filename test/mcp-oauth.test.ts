@@ -113,6 +113,7 @@ async function authorize(
   email: string,
   decision = 'allow',
   verified = true,
+  browser: 'same' | 'other' = 'same',
 ) {
   const q = new URLSearchParams({
     response_type: 'code',
@@ -126,10 +127,14 @@ async function authorize(
   });
   const start = await c.app.inject({ method: 'GET', url: `/oauth2/authorize?${q}` });
   expect(start.statusCode).toBe(302);
+  // Behave like a browser: the cookie set at /oauth2/authorize comes back on the callback and consent.
+  const setCookie = String(start.headers['set-cookie'] ?? '');
+  const cookie = browser === 'same' ? setCookie.split(';')[0] : '';
   const login = oidc!.approve(start.headers.location as string, email, verified);
   const cb = await c.app.inject({
     method: 'GET',
     url: `/oauth2/callback?code=${login.code}&state=${encodeURIComponent(login.state)}`,
+    headers: cookie ? { cookie } : {},
   });
   if (cb.statusCode !== 200) return { consent: cb };
   const field = (n: string) => new RegExp(`name="${n}" value="([^"]+)"`).exec(cb.body)![1];
@@ -137,9 +142,9 @@ async function authorize(
     method: 'POST',
     url: '/oauth2/consent',
     payload: `request_id=${field('request_id')}&consent_token=${encodeURIComponent(field('consent_token'))}&decision=${decision}`,
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...(cookie ? { cookie } : {}) },
   });
-  return { consent: cb, done, back: new URL(done.headers.location as string) };
+  return { consent: cb, done, back: new URL(done.headers.location as string), setCookie };
 }
 
 const token = (c: Ctx, body: Record<string, string>) =>
@@ -219,16 +224,6 @@ describe('MCP OAuth (hub as authorization server, Keycloak sign-in)', () => {
     const tokens = t.json();
     expect(tokens).toMatchObject({ token_type: 'Bearer', expires_in: 3600, scope: 'mcp' });
     expect(t.headers['cache-control']).toBe('no-store');
-
-    // Code is single use.
-    const replay = await token(ctx!, {
-      grant_type: 'authorization_code',
-      code,
-      code_verifier: verifier,
-      redirect_uri: REDIRECT,
-      client_id: client.client_id,
-    });
-    expect(replay.json().error).toBe('invalid_grant');
 
     // Real MCP client with the OAuth access token.
     await ctx!.app.inject({
@@ -391,5 +386,121 @@ describe('MCP OAuth (hub as authorization server, Keycloak sign-in)', () => {
       payload: {},
     });
     expect(no.statusCode).toBe(401);
+  });
+
+  it('refuses to continue a sign-in in a browser other than the one that started it (request forgery)', async () => {
+    const { client, resource } = await boot();
+    // Attacker starts the flow with their own client and sends the Keycloak link to a victim.
+    const forged = await authorize(
+      ctx!,
+      client.client_id,
+      resource,
+      'victim@acme.test',
+      'allow',
+      true,
+      'other',
+    );
+    expect(forged.consent.statusCode).toBe(403);
+    expect(forged.consent.body).toContain('different browser');
+    // The legitimate path sets a host-only, HttpOnly, SameSite cookie.
+    const ok = await authorize(ctx!, client.client_id, resource, 'a@acme.test');
+    expect(ok.setCookie).toMatch(/^chub_oauth=[A-Za-z0-9_-]+; Max-Age=600; Path=\/; HttpOnly; SameSite=Lax$/);
+    expect(ok.back!.searchParams.get('code')).toBeTruthy();
+  });
+
+  it('cuts off access when the tenant removes a person or domain from the sign-in policy', async () => {
+    const { server, client, resource } = await boot();
+    const { back } = await authorize(ctx!, client.client_id, resource, 'leaver@acme.test');
+    const tokens = (
+      await token(ctx!, {
+        grant_type: 'authorization_code',
+        code: back!.searchParams.get('code')!,
+        code_verifier: verifier,
+        redirect_uri: REDIRECT,
+        client_id: client.client_id,
+      })
+    ).json();
+    const probe = (t: string) =>
+      ctx!.app.inject({
+        method: 'POST',
+        url: `/mcp/s/${server.id}`,
+        headers: { authorization: `Bearer ${t}`, accept: 'application/json, text/event-stream' },
+        payload: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+      });
+    expect((await probe(tokens.access_token)).statusCode).toBe(200);
+    await ctx!.app.inject({
+      method: 'PUT',
+      url: '/v1/settings/sso',
+      headers: ctx!.auth,
+      payload: { allowed_domains: ['other.test'] },
+    });
+    expect((await probe(tokens.access_token)).statusCode).toBe(401);
+    const refreshed = await token(ctx!, {
+      grant_type: 'refresh_token',
+      refresh_token: tokens.refresh_token,
+      client_id: client.client_id,
+    });
+    expect(refreshed.json().error).toBe('invalid_grant');
+  });
+
+  it('does not burn a code on a failed redemption, and a replayed code revokes the tokens it produced', async () => {
+    const { server, client, resource } = await boot();
+    const { back } = await authorize(ctx!, client.client_id, resource, 'a@acme.test');
+    const code = back!.searchParams.get('code')!;
+    const wrong = await token(ctx!, {
+      grant_type: 'authorization_code',
+      code,
+      code_verifier: 'not-the-verifier',
+      redirect_uri: REDIRECT,
+      client_id: client.client_id,
+    });
+    expect(wrong.json().error_description).toContain('PKCE');
+    const good = (
+      await token(ctx!, {
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: verifier,
+        redirect_uri: REDIRECT,
+        client_id: client.client_id,
+      })
+    ).json();
+    expect(good.access_token).toBeTruthy();
+    const replay = await token(ctx!, {
+      grant_type: 'authorization_code',
+      code,
+      code_verifier: verifier,
+      redirect_uri: REDIRECT,
+      client_id: client.client_id,
+    });
+    expect(replay.json().error).toBe('invalid_grant');
+    const probe = await ctx!.app.inject({
+      method: 'POST',
+      url: `/mcp/s/${server.id}`,
+      headers: { authorization: `Bearer ${good.access_token}` },
+      payload: {},
+    });
+    expect(probe.statusCode).toBe(401);
+  });
+
+  it('answers malformed registration and client credentials with OAuth errors, not 500s', async () => {
+    await boot();
+    const reg = await ctx!.app.inject({
+      method: 'POST',
+      url: '/oauth2/register',
+      payload: { redirect_uris: [REDIRECT], grant_types: 'authorization_code' },
+    });
+    expect(reg.statusCode).toBe(400);
+    expect(reg.json().error).toBe('invalid_client_metadata');
+    const basic = await ctx!.app.inject({
+      method: 'POST',
+      url: '/oauth2/token',
+      headers: {
+        authorization: `Basic ${Buffer.from('%E0%A4%A:x').toString('base64')}`,
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      payload: 'grant_type=refresh_token&refresh_token=x',
+    });
+    expect(basic.statusCode).toBe(401);
+    expect(basic.json().error).toBe('invalid_client');
   });
 });

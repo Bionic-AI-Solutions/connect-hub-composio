@@ -357,7 +357,13 @@ export class ConnectionService {
       fields.client_secret = client.clientSecret;
     }
     const body = json ? JSON.stringify(fields) : new URLSearchParams(fields);
-    const res = await fetch(tokenUrl, { method: 'POST', headers, body });
+    // Bounded well inside the refresh lease, so a slow provider cannot outlive the lease (see refreshWithLease).
+    const res = await fetch(tokenUrl, {
+      method: 'POST',
+      headers,
+      body,
+      signal: AbortSignal.timeout(this.tokenTimeoutMs),
+    });
     const text = await res.text();
     let data: Record<string, any>;
     try {
@@ -613,10 +619,11 @@ export class ConnectionService {
       value = await this.refresh(row, value);
     }
     if (this.vault.isStale(row.credentials_enc!)) {
-      await this.db.query('UPDATE connected_accounts SET credentials_enc = $1 WHERE id = $2', [
-        this.vault.encrypt(value, row.tenant_id),
-        row.id,
-      ]);
+      // Conditional: never overwrite credentials another replica stored after we read the row.
+      await this.db.query(
+        'UPDATE connected_accounts SET credentials_enc = $1 WHERE id = $2 AND credentials_enc = $3',
+        [this.vault.encrypt(value, row.tenant_id), row.id, row.credentials_enc],
+      );
     }
     return { account: publicAccount(row), value };
   }
@@ -644,25 +651,31 @@ export class ConnectionService {
   }
 
   private static readonly LEASE_WAIT_MS = 15_000;
+  /** Lease length. Must stay well above tokenTimeoutMs so a refresh never outlives its lease. */
+  leaseSeconds = 30;
+  /** Token endpoint timeout. */
+  tokenTimeoutMs = 15_000;
 
   private async refreshWithLease(accountId: string, force: boolean): Promise<ConnectionValue> {
     const deadline = Date.now() + ConnectionService.LEASE_WAIT_MS;
     // A forced refresh that had to wait for another replica's refresh does not refresh again.
     for (let attempt = 0; ; attempt++) {
       const leased = (
-        await this.db.query<AccountRow>(
-          `UPDATE connected_accounts SET refresh_lock_until = now() + interval '30 seconds'
+        await this.db.query<AccountRow & { refresh_lock_until: Date | string }>(
+          `UPDATE connected_accounts SET refresh_lock_until = now() + make_interval(secs => $2)
            WHERE id = $1 AND (refresh_lock_until IS NULL OR refresh_lock_until < now()) RETURNING *`,
-          [accountId],
+          [accountId, this.leaseSeconds],
         )
       ).rows[0];
       if (leased) {
         try {
           return await this.refreshLeased(leased, force && attempt === 0);
         } finally {
-          await this.db.query('UPDATE connected_accounts SET refresh_lock_until = NULL WHERE id = $1', [
-            accountId,
-          ]);
+          // Release only our own lease: if it expired and another replica took it, leave theirs alone.
+          await this.db.query(
+            'UPDATE connected_accounts SET refresh_lock_until = NULL WHERE id = $1 AND refresh_lock_until = $2',
+            [accountId, leased.refresh_lock_until],
+          );
         }
       }
       // Another replica holds the lease: wait for it, then use whatever it stored.
@@ -724,17 +737,29 @@ export class ConnectionService {
       };
       const expiresAt = next.expires_in ? new Date((next.claimed_at + next.expires_in) * 1000) : null;
       await this.db.query(
-        `UPDATE connected_accounts SET credentials_enc = $1, expires_at = $2, last_error = NULL, updated_at = now() WHERE id = $3`,
+        `UPDATE connected_accounts SET credentials_enc = $1, expires_at = $2, status = 'ACTIVE', last_error = NULL,
+           updated_at = now() WHERE id = $3`,
         [this.vault.encrypt(next, row.tenant_id), expiresAt, row.id],
       );
       return next;
     } catch (e) {
       const err = e as AppError;
       if (err.code === 'invalid_grant') {
-        await this.db.query(
-          `UPDATE connected_accounts SET status = 'EXPIRED', last_error = $1, updated_at = now() WHERE id = $2`,
-          [err.message, row.id],
+        // Only expire the account if nobody stored new credentials meanwhile. With rotating refresh tokens, an
+        // invalid_grant can simply mean another replica already used this refresh token successfully.
+        const expired = await this.db.query(
+          `UPDATE connected_accounts SET status = 'EXPIRED', last_error = $1, updated_at = now()
+           WHERE id = $2 AND credentials_enc = $3 RETURNING id`,
+          [err.message, row.id, row.credentials_enc],
         );
+        if (!expired.rows.length) {
+          const current = (
+            await this.db.query<AccountRow>('SELECT * FROM connected_accounts WHERE id = $1', [row.id])
+          ).rows[0];
+          if (current?.status === 'ACTIVE' && current.credentials_enc) {
+            return this.vault.decrypt<ConnectionValue>(current.credentials_enc, current.tenant_id);
+          }
+        }
         throw new AppError(
           409,
           'account_not_active',

@@ -159,6 +159,49 @@ describe('OAuth2 flow', () => {
     expect(acct.refresh_lock_until).toBeUndefined();
   });
 
+  it('keeps the account ACTIVE when a lease expires mid-refresh and another replica gets invalid_grant', async () => {
+    ctx = await setup({ withProvider: true });
+    await oauthConnect(ctx, 'u1');
+    await ctx.services.db.query(`UPDATE connected_accounts SET expires_at = now() - interval '1 minute'`);
+    // Replica A: lease shorter than its (slow) token request, simulating a stalled refresh that outlives the lease.
+    ctx.services.connections.leaseSeconds = 1;
+    ctx.provider!.state.refreshDelayMs = 1800;
+    const replica = createServices(ctx.services.config, ctx.services.db, ctx.services.registry);
+    const run = (svc: typeof replica) =>
+      svc.executor.execute({ tenantId: ctx!.tenant.id, userId: 'u1', tool: 'mockapp.whoami' });
+    const a = run(ctx.services);
+    await new Promise((r) => setTimeout(r, 1300)); // A's lease has expired; B takes over with the same refresh token
+    const b = await run(replica);
+    const first = await a;
+    expect(first.successful).toBe(true);
+    expect(b.error?.code ?? 'ok').not.toBe('connection_required');
+    const acct = (
+      await ctx.app.inject({ method: 'GET', url: '/v1/connected-accounts?user_id=u1', headers: ctx.auth })
+    ).json().items[0];
+    expect(acct.status).toBe('ACTIVE');
+    // The account keeps working afterwards.
+    ctx.provider!.state.refreshDelayMs = 0;
+    expect((await run(replica)).successful).toBe(true);
+  });
+
+  it('aborts a token request that hangs instead of holding the lease forever', async () => {
+    ctx = await setup({ withProvider: true });
+    await oauthConnect(ctx, 'u1');
+    await ctx.services.db.query(`UPDATE connected_accounts SET expires_at = now() - interval '1 minute'`);
+    ctx.services.connections.tokenTimeoutMs = 300;
+    ctx.provider!.state.refreshDelayMs = 3000;
+    const started = Date.now();
+    const r = await ctx.services.executor.execute({
+      tenantId: ctx.tenant.id,
+      userId: 'u1',
+      tool: 'mockapp.whoami',
+    });
+    expect(r.successful).toBe(false);
+    expect(Date.now() - started).toBeLessThan(2500);
+    const { rows } = await ctx.services.db.query('SELECT status, refresh_lock_until FROM connected_accounts');
+    expect(rows[0]).toMatchObject({ status: 'ACTIVE', refresh_lock_until: null });
+  });
+
   it('sends JSON token requests to providers that document them (Atlassian)', async () => {
     ctx = await setup({ withProvider: true, tokenFormat: 'json' });
     const cb = await oauthConnect(ctx, 'u1');

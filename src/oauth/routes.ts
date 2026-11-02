@@ -28,8 +28,21 @@ const oauthJson = (reply: FastifyReply, e: unknown) => {
   throw e;
 };
 
+function readCookie(header: string | undefined, name: string): string | undefined {
+  for (const part of (header ?? '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return undefined;
+}
+
 /** Public OAuth endpoints (discovery, registration, authorize, token). */
 export async function registerOAuthRoutes(app: FastifyInstance, s: Services) {
+  // Browser binding for the authorization flow. __Host- (Secure, path=/, no Domain) whenever the hub is on https.
+  const secure = s.config.PUBLIC_URL.startsWith('https://');
+  const cookieName = secure ? '__Host-chub_oauth' : 'chub_oauth';
+  const cookieAttrs = `Path=/; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`;
+  const browserNonce = (req: { headers: { cookie?: string } }) => readCookie(req.headers.cookie, cookieName);
   app.get<{ Params: { serverId: string } }>(
     '/.well-known/oauth-protected-resource/mcp/s/:serverId',
     async (req, reply) => {
@@ -57,7 +70,10 @@ export async function registerOAuthRoutes(app: FastifyInstance, s: Services) {
         const server = await s.mcp.getServer(id);
         return server ? { tenantId: server.tenant_id } : undefined;
       });
-      return reply.redirect(next);
+      if (next.browserNonce) {
+        reply.header('set-cookie', `${cookieName}=${next.browserNonce}; Max-Age=600; ${cookieAttrs}`);
+      }
+      return reply.redirect(next.location);
     } catch (e) {
       if (e instanceof AppError)
         return securePage(reply, messagePage('Cannot authorize', e.message, true), e.statusCode);
@@ -76,7 +92,7 @@ export async function registerOAuthRoutes(app: FastifyInstance, s: Services) {
         );
       }
       try {
-        const r = await s.oauth.completeSignIn(req.query.state ?? '', req.query.code);
+        const r = await s.oauth.completeSignIn(req.query.state ?? '', req.query.code, browserNonce(req));
         const server = await s.mcp.getServer(r.serverId);
         return securePage(
           reply,
@@ -105,9 +121,14 @@ export async function registerOAuthRoutes(app: FastifyInstance, s: Services) {
     async (req, reply) => {
       try {
         const b = req.body ?? {};
-        return reply.redirect(
-          await s.oauth.decide(b.request_id ?? '', b.consent_token ?? '', b.decision === 'allow'),
+        const next = await s.oauth.decide(
+          b.request_id ?? '',
+          b.consent_token ?? '',
+          b.decision === 'allow',
+          browserNonce(req),
         );
+        reply.header('set-cookie', `${cookieName}=; Max-Age=0; ${cookieAttrs}`);
+        return reply.redirect(next);
       } catch (e) {
         if (e instanceof AppError)
           return securePage(reply, messagePage('Cannot authorize', e.message, true), e.statusCode);
