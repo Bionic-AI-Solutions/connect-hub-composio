@@ -60,7 +60,7 @@ GitHub Apps (also supported) give finer, per-repository permissions.
 
 1. In the Atlassian developer console, create an OAuth 2.0 (3LO) integration with the Jira and Confluence scopes
    listed in `src/catalog/native/atlassian.ts`, and set the callback URL.
-2. Set **Distribution** to *Sharing* so users outside your own Atlassian organization can authorize it. Give a
+2. Set **Distribution** to _Sharing_ so users outside your own Atlassian organization can authorize it. Give a
    vendor name, privacy policy and personal-data declaration.
 
 ## Reddit, Todoist, Zoom
