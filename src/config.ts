@@ -20,6 +20,13 @@ const schema = z.object({
   /** Comma-separated origins that connect links may redirect back to. Empty = any https origin is refused. */
   ALLOWED_REDIRECT_ORIGINS: z.string().default(''),
   LOG_LEVEL: z.string().default('info'),
+  /** Seconds between trigger scheduler passes (polling, delivery, renewals). 0 disables the scheduler. */
+  TRIGGER_TICK_SECONDS: z.coerce.number().int().nonnegative().default(10),
+  /** Allow trigger webhooks to http/private addresses. Only for tests and trusted single-tenant setups. */
+  TRIGGER_ALLOW_PRIVATE_WEBHOOKS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 });
 
 export type Config = z.infer<typeof schema> & {

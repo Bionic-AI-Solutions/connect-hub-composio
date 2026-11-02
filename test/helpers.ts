@@ -117,6 +117,9 @@ export function mockOAuthToolkit(base: string, opts: { tokenFormat?: 'form' | 'j
 }
 
 /** A fake Activepieces piece, run through the real adapter. */
+/** Records trigger lifecycle calls made by the fake piece, for assertions. */
+export const fakeTriggerLog: { event: string; detail?: unknown }[] = [];
+
 export const fakePiece: ApPiece = {
   displayName: 'Fake Piece',
   description: 'Adapter test piece',
@@ -127,6 +130,59 @@ export const fakePiece: ApPiece = {
     validate: async ({ auth }: { auth: string }) =>
       auth === 'good-key' ? { valid: true } : { valid: false, error: 'bad key' },
   },
+  triggers: () => ({
+    new_item: {
+      name: 'new_item',
+      displayName: 'New item',
+      description: 'Polls for new items',
+      type: 'POLLING',
+      props: { label: { type: 'SHORT_TEXT', displayName: 'Label', required: true } },
+      onEnable: async (ctx: any) => {
+        await ctx.store.put('cursor', 0);
+        fakeTriggerLog.push({ event: 'enable', detail: ctx.propsValue });
+      },
+      onDisable: async () => {
+        fakeTriggerLog.push({ event: 'disable:new_item' });
+      },
+      run: async (ctx: any) => {
+        const cursor = (await ctx.store.get('cursor')) ?? 0;
+        await ctx.store.put('cursor', cursor + 2);
+        return [
+          { n: cursor + 1, label: ctx.propsValue.label, secret: ctx.auth.secret_text },
+          { n: cursor + 2, label: ctx.propsValue.label },
+        ];
+      },
+    },
+    on_event: {
+      name: 'on_event',
+      displayName: 'On event',
+      description: 'Provider pushes events',
+      type: 'WEBHOOK',
+      props: {},
+      handshakeConfiguration: { strategy: 'QUERY_PRESENT', paramName: 'challenge' },
+      onHandshake: async (ctx: any) => ({
+        status: 200,
+        body: { challenge: ctx.payload.queryParams.challenge },
+      }),
+      onEnable: async (ctx: any) => {
+        await ctx.store.put('registered', ctx.webhookUrl);
+        fakeTriggerLog.push({ event: 'register', detail: ctx.webhookUrl });
+      },
+      onDisable: async (ctx: any) => {
+        fakeTriggerLog.push({ event: 'unregister', detail: await ctx.store.get('registered') });
+      },
+      run: async (ctx: any) => (ctx.payload.body?.ignore ? [] : [ctx.payload.body]),
+    },
+    app_only: {
+      name: 'app_only',
+      displayName: 'App webhook',
+      type: 'APP_WEBHOOK',
+      props: {},
+      onEnable: async () => undefined,
+      onDisable: async () => undefined,
+      run: async () => [],
+    },
+  }),
   actions: () => ({
     echo: {
       name: 'echo',
@@ -162,6 +218,8 @@ export async function setup(opts: { withProvider?: boolean; tokenFormat?: 'form'
     ADMIN_TOKEN,
     PUBLIC_URL: 'http://hub.test',
     REFRESH_SWEEP_SECONDS: '0',
+    TRIGGER_TICK_SECONDS: '0',
+    TRIGGER_ALLOW_PRIVATE_WEBHOOKS: 'true',
     OAUTH_MOCKAPP_CLIENT_ID: 'mock-client',
     OAUTH_MOCKAPP_CLIENT_SECRET: 'mock-secret',
     ALLOWED_REDIRECT_ORIGINS: 'https://app.example.com',

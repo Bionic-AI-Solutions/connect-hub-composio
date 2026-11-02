@@ -11,6 +11,10 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type {
   AuthScheme,
+  TriggerDef,
+  TriggerHooks,
+  TriggerRuntime,
+  WebhookPayload,
   ConnectionValue,
   ExecutionContext,
   FieldDef,
@@ -52,7 +56,27 @@ export type ApPiece = {
   categories?: string[];
   auth?: any;
   actions(): Record<string, ApAction>;
+  triggers?(): Record<string, ApTrigger>;
 };
+
+type ApTrigger = {
+  name: string;
+  displayName: string;
+  description?: string;
+  type: string;
+  props: Record<string, ApProp>;
+  sampleData?: unknown;
+  handshakeConfiguration?: { strategy: string; paramName?: string };
+  renewConfiguration?: { strategy: string };
+  onEnable(ctx: unknown): Promise<void>;
+  onDisable(ctx: unknown): Promise<void>;
+  run(ctx: unknown): Promise<unknown[]>;
+  onHandshake?(ctx: unknown): Promise<{ status: number; body?: unknown; headers?: Record<string, string> }>;
+  onRenew?(ctx: unknown): Promise<void>;
+};
+
+/** Trigger strategies the hub can run. APP_WEBHOOK needs one central app subscription per provider (not yet). */
+const SUPPORTED_TRIGGER_TYPES = new Set(['POLLING', 'WEBHOOK']);
 
 /** Display-only prop types that carry no input. */
 const NON_INPUT = new Set(['MARKDOWN']);
@@ -395,8 +419,114 @@ function buildContext(
   };
 }
 
+function triggerContext(
+  trigger: ApTrigger,
+  rt: TriggerRuntime,
+  propsValue: Record<string, unknown>,
+  payload?: WebhookPayload,
+) {
+  return {
+    auth: rt.auth,
+    propsValue,
+    store: rt.store,
+    webhookUrl: rt.webhookUrl,
+    payload: payload ?? { body: {}, headers: {}, queryParams: {} },
+    server: { apiUrl: `${rt.publicUrl}/`, publicUrl: `${rt.publicUrl}/`, token: '' },
+    project: { id: rt.tenantId, externalId: async () => undefined },
+    connections: { get: async () => null },
+    flows: {
+      list: async () => ({ data: [], next: null, previous: null }),
+      current: { id: 'hub', version: { id: 'hub' } },
+    },
+    step: { name: trigger.name },
+    setSchedule: () => undefined,
+    isRepublish: false,
+    run: { id: randomUUID() },
+    files: {
+      write: async ({ fileName, data }: { fileName: string; data: Buffer }) =>
+        `data:application/octet-stream;name=${encodeURIComponent(fileName)};base64,${Buffer.from(data).toString('base64')}`,
+    },
+    app: {
+      createListeners: () => {
+        throw new Error('App-level webhook listeners are not supported by the hub');
+      },
+    },
+  };
+}
+
+function handshakeMatches(cfg: ApTrigger['handshakeConfiguration'], p: WebhookPayload): boolean {
+  if (!cfg || !cfg.paramName || cfg.strategy === 'NONE') return false;
+  const name = cfg.paramName;
+  switch (cfg.strategy) {
+    case 'HEADER_PRESENT':
+      return p.headers[name.toLowerCase()] !== undefined;
+    case 'QUERY_PRESENT':
+      return p.queryParams[name] !== undefined;
+    case 'BODY_PARAM_PRESENT':
+      return (
+        !!p.body && typeof p.body === 'object' && (p.body as Record<string, unknown>)[name] !== undefined
+      );
+    default:
+      return false;
+  }
+}
+
+function pieceTriggers(
+  slug: string,
+  piece: ApPiece,
+): { defs: TriggerDef[]; hooks: TriggerHooks } | undefined {
+  const all = piece.triggers ? piece.triggers() : {};
+  const usable = Object.values(all).filter((t) => SUPPORTED_TRIGGER_TYPES.has(t.type));
+  if (!usable.length) return undefined;
+  const byName = new Map(usable.map((t) => [t.name, t]));
+  const get = (name: string) => {
+    const t = byName.get(name);
+    if (!t) throw new ToolInputError(`Unknown trigger "${name}" in toolkit "${slug}"`);
+    return t;
+  };
+  const props = async (t: ApTrigger, rt: TriggerRuntime) => normalizeArgs(t.props, rt.config);
+  return {
+    defs: usable.map((t) => ({
+      slug: `${slug}.${t.name}`,
+      toolkit: slug,
+      name: t.name,
+      displayName: t.displayName,
+      description: t.description || t.displayName,
+      strategy: t.type as TriggerDef['strategy'],
+      inputSchema: propsToObjectSchema(t.props),
+      sampleData: t.sampleData,
+      renews: !!t.onRenew && !!t.renewConfiguration && t.renewConfiguration.strategy !== 'NONE',
+    })),
+    hooks: {
+      async enable(name, rt) {
+        const t = get(name);
+        await t.onEnable(triggerContext(t, rt, await props(t, rt)));
+      },
+      async disable(name, rt) {
+        const t = get(name);
+        await t.onDisable(triggerContext(t, rt, await props(t, rt)));
+      },
+      async run(name, rt, payload) {
+        const t = get(name);
+        const items = await t.run(triggerContext(t, rt, await props(t, rt), payload));
+        return Array.isArray(items) ? items : [];
+      },
+      async handshake(name, rt, payload) {
+        const t = get(name);
+        if (!t.onHandshake || !handshakeMatches(t.handshakeConfiguration, payload)) return undefined;
+        return t.onHandshake(triggerContext(t, rt, await props(t, rt), payload));
+      },
+      async renew(name, rt) {
+        const t = get(name);
+        if (t.onRenew) await t.onRenew(triggerContext(t, rt, await props(t, rt)));
+      },
+    },
+  };
+}
+
 export function pieceToToolkit(slug: string, piece: ApPiece, version?: string): Toolkit {
   const actions = piece.actions();
+  const triggers = pieceTriggers(slug, piece);
   const tools: ToolDef[] = Object.values(actions).map((a) => ({
     slug: `${slug}.${a.name}`,
     toolkit: slug,
@@ -425,6 +555,8 @@ export function pieceToToolkit(slug: string, piece: ApPiece, version?: string): 
     version,
     authSchemes: authSchemesFromPiece(piece),
     tools,
+    triggers: triggers?.defs,
+    triggerHooks: triggers?.hooks,
 
     async execute(actionName, args, auth, ctx) {
       const action = getAction(actionName);

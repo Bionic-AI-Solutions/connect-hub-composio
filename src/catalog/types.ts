@@ -136,6 +136,57 @@ export interface Toolkit {
   validate?(auth: ConnectionValue): Promise<{ valid: boolean; error?: string }>;
   /** Optional human label for the account (email, login, workspace). */
   identify?(auth: ConnectionValue): Promise<string | undefined>;
+  /** Event sources (new email, new PR…). Absent when the toolkit has none. */
+  triggers?: TriggerDef[];
+  triggerHooks?: TriggerHooks;
+}
+
+export type TriggerStrategy = 'POLLING' | 'WEBHOOK';
+
+export interface TriggerDef {
+  /** Globally unique: `<toolkit>.<trigger>`. */
+  slug: string;
+  toolkit: string;
+  name: string;
+  displayName: string;
+  description: string;
+  strategy: TriggerStrategy;
+  inputSchema: JsonSchema;
+  sampleData?: unknown;
+  /** Webhook triggers whose provider subscription expires and must be renewed periodically. */
+  renews?: boolean;
+}
+
+export interface TriggerRuntime {
+  auth: ConnectionValue | undefined;
+  config: Record<string, unknown>;
+  store: ExecutionContext['store'];
+  /** Public URL the provider should call (webhook triggers). */
+  webhookUrl: string;
+  tenantId: string;
+  publicUrl: string;
+}
+
+export interface WebhookPayload {
+  body: unknown;
+  rawBody?: string;
+  headers: Record<string, string>;
+  queryParams: Record<string, string>;
+}
+
+export interface TriggerHooks {
+  /** Validate inputs and register with the provider (webhooks) or set the polling baseline. */
+  enable(trigger: string, rt: TriggerRuntime): Promise<void>;
+  disable(trigger: string, rt: TriggerRuntime): Promise<void>;
+  /** Polling: fetch new items since the last run. Webhook: turn one delivery into zero or more events. */
+  run(trigger: string, rt: TriggerRuntime, payload?: WebhookPayload): Promise<unknown[]>;
+  /** Provider verification requests (e.g. challenge echo). Returns undefined when this request is not one. */
+  handshake?(
+    trigger: string,
+    rt: TriggerRuntime,
+    payload: WebhookPayload,
+  ): Promise<{ status: number; body?: unknown; headers?: Record<string, string> } | undefined>;
+  renew?(trigger: string, rt: TriggerRuntime): Promise<void>;
 }
 
 export class ToolInputError extends Error {

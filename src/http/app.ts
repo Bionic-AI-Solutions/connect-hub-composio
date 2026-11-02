@@ -10,6 +10,8 @@ import { TenantService } from '../tenancy/tenants.js';
 import { ConnectionService } from '../auth/connections.js';
 import { Executor } from '../execute/executor.js';
 import { McpService } from '../mcp/gateway.js';
+import { TriggerService } from '../triggers/service.js';
+import { registerHookEndpoint, registerTriggerApi } from './trigger-routes.js';
 import { connectPage, messagePage } from '../connect/pages.js';
 import { AppError, badRequest, unauthorized } from '../errors.js';
 import type { Toolkit } from '../catalog/types.js';
@@ -30,6 +32,7 @@ export interface Services {
   connections: ConnectionService;
   executor: Executor;
   mcp: McpService;
+  triggers: TriggerService;
 }
 
 export function createServices(config: Config, db: Db, registry: Registry): Services {
@@ -38,7 +41,8 @@ export function createServices(config: Config, db: Db, registry: Registry): Serv
   const connections = new ConnectionService(db, vault, registry, config);
   const executor = new Executor(db, registry, connections, config);
   const mcp = new McpService(db, registry, executor, connections, config.PUBLIC_URL);
-  return { config, db, vault, registry, tenants, connections, executor, mcp };
+  const triggers = new TriggerService(db, vault, registry, connections, config);
+  return { config, db, vault, registry, tenants, connections, executor, mcp, triggers };
 }
 
 function bearerToken(req: FastifyRequest): string | undefined {
@@ -292,6 +296,8 @@ export async function buildApp(
       return reply.status(204).send();
     });
 
+    registerTriggerApi(v1, s.triggers);
+
     // Audit
     v1.get<{ Querystring: { user_id?: string; limit?: string } }>('/v1/audit-logs', async (req) => {
       const { rows } = await s.db.query(
@@ -465,6 +471,8 @@ export async function buildApp(
   app.post('/mcp', mcpHandler);
   app.get('/mcp', mcpHandler);
   app.delete('/mcp', mcpHandler);
+
+  await registerHookEndpoint(app, s.triggers);
 
   return app;
 }
