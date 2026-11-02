@@ -196,9 +196,17 @@ export class ConnectionService {
     }
     const scopes = cfg?.scopes?.length ? cfg.scopes : scheme.oauth2!.scopes;
     if (cfg && !cfg.use_platform_app && cfg.client_id && cfg.client_secret_enc) {
+      const clientSecret = this.vault.decrypt<string>(cfg.client_secret_enc, tenantId);
+      if (this.vault.isStale(cfg.client_secret_enc)) {
+        // Upgrade older envelopes to the tenant-scoped format (conditional, so concurrent upgrades are harmless).
+        await this.db.query(
+          'UPDATE auth_configs SET client_secret_enc = $1 WHERE id = $2 AND client_secret_enc = $3',
+          [this.vault.encrypt(clientSecret, tenantId), cfg.id, cfg.client_secret_enc],
+        );
+      }
       return {
         clientId: cfg.client_id,
-        clientSecret: this.vault.decrypt<string>(cfg.client_secret_enc, tenantId),
+        clientSecret,
         scopes,
         authConfigId: cfg.id,
       };

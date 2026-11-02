@@ -245,6 +245,25 @@ describe('OAuth2 flow', () => {
     expect(authorize.searchParams.get('scope')).toBe('read write');
   });
 
+  it('upgrades a pre-tenant (v1) OAuth app secret to the tenant-scoped format when it is used', async () => {
+    ctx = await setup({ withProvider: true });
+    await ctx.app.inject({
+      method: 'POST',
+      url: '/v1/auth-configs',
+      headers: ctx.auth,
+      payload: { toolkit: 'mockapp', client_id: 'mock-client', client_secret: 'mock-secret' },
+    });
+    // Simulate data written before tenant-scoped encryption existed.
+    await ctx.services.db.query('UPDATE auth_configs SET client_secret_enc = $1', [
+      ctx.services.vault.encrypt('mock-secret'),
+    ]);
+    const cb = await oauthConnect(ctx, 'u1');
+    expect(cb.statusCode).toBe(200);
+    const { rows } = await ctx.services.db.query('SELECT client_secret_enc FROM auth_configs');
+    expect(rows[0].client_secret_enc.startsWith('v2.')).toBe(true);
+    expect(ctx.services.vault.decrypt(rows[0].client_secret_enc, ctx.tenant.id)).toBe('mock-secret');
+  });
+
   it('explains a missing OAuth app', async () => {
     ctx = await setup();
     const r = await ctx.app.inject({

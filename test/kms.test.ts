@@ -84,4 +84,15 @@ describe('master keys from Vault Transit', () => {
     } as any);
     await expect(resolveMasterKeys(bad)).rejects.toThrow(/vault:v/);
   });
+
+  it('requires https for the sign-in issuer and Vault, except loopback and in-cluster Vault', () => {
+    const cfg = (extra: Record<string, string>) => () =>
+      loadConfig({ ...base, MASTER_KEYS: `k1:${plaintextKey}`, ...extra } as any);
+    expect(cfg({ OIDC_ISSUER: 'http://keycloak.example.com/realms/x' })).toThrow(/OIDC_ISSUER/);
+    expect(cfg({ OIDC_ISSUER: 'https://keycloak.example.com/realms/x' })).not.toThrow();
+    expect(cfg({ OIDC_ISSUER: 'http://127.0.0.1:8080/realms/x' })).not.toThrow();
+    expect(cfg({ VAULT_ADDR: 'http://vault.example.com:8200' })).toThrow(/VAULT_ADDR/);
+    expect(cfg({ VAULT_ADDR: 'http://vault.vault.svc.cluster.local:8200' })).not.toThrow();
+    expect(cfg({ OIDC_ISSUER: 'http://keycloak.keycloak.svc/realms/x' })).toThrow(/OIDC_ISSUER/);
+  });
 });

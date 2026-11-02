@@ -103,3 +103,10 @@ Every query is scoped by `tenant_id`.
 - `files.write` returns a `data:` URL; large file outputs should go to object storage.
 - The per-minute rate limit uses fixed one-minute windows, so bursts can reach up to twice the limit across a
   window boundary.
+- Plan limits are enforced per tenant across replicas, but not to the exact call: limits are cached for 30 s per
+  process, and the monthly quota is a read-then-act check, so N simultaneous calls can overshoot by up to N-1.
+- `/oauth2/register` is open, as dynamic client registration requires; it relies on the global rate limit. The
+  consent page names the client and its redirect host, and an authorization only continues in the browser that
+  started it.
+- Pre-v2 (master-key) envelopes are upgraded to tenant-scoped ones when used: account credentials and OAuth app
+  secrets. Connect requests expire after 30 minutes, so older ones age out.

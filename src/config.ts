@@ -1,5 +1,19 @@
 import { z } from 'zod';
 
+/** https, or http to a loopback address (dev/tests) or, when allowed, a cluster-internal service name. */
+function secureOrInternal(raw: string, allowClusterInternal: boolean): boolean {
+  try {
+    const u = new URL(raw);
+    if (u.protocol === 'https:') return true;
+    if (u.protocol !== 'http:') return false;
+    const h = u.hostname;
+    if (['localhost', '127.0.0.1', '[::1]'].includes(h)) return true;
+    return allowClusterInternal && (h.endsWith('.svc') || h.endsWith('.svc.cluster.local'));
+  } catch {
+    return false;
+  }
+}
+
 const schema = z.object({
   PORT: z.coerce.number().int().default(3000),
   HOST: z.string().default('0.0.0.0'),
@@ -17,7 +31,14 @@ const schema = z.object({
    * the plaintext keys never sit in a Kubernetes secret. Requires VAULT_ADDR and VAULT_TOKEN or VAULT_K8S_ROLE.
    */
   MASTER_KEYS_WRAPPED: z.string().optional(),
-  VAULT_ADDR: z.string().url().optional(),
+  VAULT_ADDR: z
+    .string()
+    .url()
+    .refine(
+      (u) => secureOrInternal(u, true),
+      'VAULT_ADDR must be https (http only for localhost or in-cluster *.svc)',
+    )
+    .optional(),
   VAULT_TOKEN: z.string().optional(),
   VAULT_K8S_ROLE: z.string().optional(),
   VAULT_K8S_MOUNT: z.string().default('kubernetes'),
@@ -32,7 +53,12 @@ const schema = z.object({
   ALLOWED_REDIRECT_ORIGINS: z.string().default(''),
   LOG_LEVEL: z.string().default('info'),
   /** OIDC provider people sign in with for MCP OAuth (e.g. https://keycloak.example.com/realms/bionic). */
-  OIDC_ISSUER: z.string().url().optional(),
+  // The ID token is trusted because it comes straight from the issuer over TLS, so the issuer must be https.
+  OIDC_ISSUER: z
+    .string()
+    .url()
+    .refine((u) => secureOrInternal(u, false), 'OIDC_ISSUER must be https (http only for localhost)')
+    .optional(),
   OIDC_CLIENT_ID: z.string().optional(),
   OIDC_CLIENT_SECRET: z.string().optional(),
   MCP_OAUTH_ACCESS_TTL_SECONDS: z.coerce.number().int().positive().default(3600),

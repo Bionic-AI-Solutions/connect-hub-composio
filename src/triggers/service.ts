@@ -19,7 +19,7 @@ import type { ExecutionContext, TriggerDef, TriggerRuntime, WebhookPayload } fro
 import { ToolInputError } from '../catalog/types.js';
 import { AppError, badRequest, notFound } from '../errors.js';
 import type { UsageService } from '../tenancy/usage.js';
-import { assertPublicWebhookUrl, assertResolvesPublic } from '../net/url-guard.js';
+import { assertPublicWebhookUrl, postWebhook } from '../net/url-guard.js';
 
 interface SubscriptionRow {
   id: string;
@@ -80,6 +80,18 @@ export function publicSubscription(r: SubscriptionRow) {
 
 const MAX_DELIVERY_ATTEMPTS = 6;
 const MAX_POLL_FAILURES = 10;
+/** A poll run is bounded well inside its 5-minute lease. */
+const POLL_TIMEOUT_MS = 2 * 60_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  return Promise.race([
+    p.finally(() => clearTimeout(timer)),
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} did not finish within ${ms / 1000}s`)), ms);
+    }),
+  ]);
+}
 const RENEW_EVERY_MS = 12 * 3600_000;
 
 /** HMAC over `<timestamp>.<body>`, hex. Receivers recompute it to verify origin and freshness. */
@@ -356,19 +368,35 @@ export class TriggerService {
 
   /** Run due polling subscriptions. Returns how many ran. */
   async pollDue(limit = 20): Promise<number> {
-    const { rows } = await this.db.query<SubscriptionRow>(
-      `UPDATE trigger_subscriptions SET lease_until = now() + interval '5 minutes'
-       WHERE id IN (
-         SELECT id FROM trigger_subscriptions
-         WHERE status = 'ACTIVE' AND strategy = 'POLLING' AND next_run_at <= now()
-           AND (lease_until IS NULL OR lease_until < now())
-         ORDER BY next_run_at LIMIT $1 FOR UPDATE SKIP LOCKED)
-       RETURNING *`,
-      [limit],
-    );
-    for (const row of rows) {
+    let ran = 0;
+    // Claim one subscription at a time: each lease covers only its own run, which is bounded well inside it, so a
+    // slow batch can never let another replica pick up subscriptions this one is still about to run.
+    for (; ran < limit; ran++) {
+      const row = (
+        await this.db.query<SubscriptionRow>(
+          `UPDATE trigger_subscriptions SET lease_until = now() + interval '5 minutes'
+           WHERE id = (
+             SELECT id FROM trigger_subscriptions
+             WHERE status = 'ACTIVE' AND strategy = 'POLLING' AND next_run_at <= now()
+               AND (lease_until IS NULL OR lease_until < now())
+             ORDER BY next_run_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+           RETURNING *`,
+        )
+      ).rows[0];
+      if (!row) break;
+      await this.pollOne(row);
+    }
+    return ran;
+  }
+
+  private async pollOne(row: SubscriptionRow) {
+    {
       try {
-        const items = await this.hooks(row.toolkit).run(row.trigger, await this.runtime(row));
+        const items = await withTimeout(
+          (async () => this.hooks(row.toolkit).run(row.trigger, await this.runtime(row)))(),
+          POLL_TIMEOUT_MS,
+          'trigger poll',
+        );
         await this.enqueue(row, items);
         await this.db.query(
           `UPDATE trigger_subscriptions SET lease_until = NULL, last_run_at = now(), last_error = NULL,
@@ -390,7 +418,6 @@ export class TriggerService {
         );
       }
     }
-    return rows.length;
   }
 
   /** Renew provider-side webhook registrations that expire (e.g. watch channels). */
@@ -418,19 +445,24 @@ export class TriggerService {
 
   /** Deliver pending events to tenant webhooks. Returns how many were attempted. */
   async deliverPending(limit = 50): Promise<number> {
-    const { rows } = await this.db.query<EventRow>(
-      `UPDATE trigger_events SET lease_until = now() + interval '2 minutes'
-       WHERE id IN (
-         SELECT id FROM trigger_events
-         WHERE status = 'PENDING' AND next_attempt_at <= now() AND (lease_until IS NULL OR lease_until < now())
-         ORDER BY seq LIMIT $1 FOR UPDATE SKIP LOCKED)
-       RETURNING *`,
-      [limit],
-    );
-    // RETURNING order is unspecified; deliver in the order events were recorded (at-least-once, best-effort order).
-    rows.sort((a, b) => Number(a.seq) - Number(b.seq));
-    for (const ev of rows) await this.deliver(ev);
-    return rows.length;
+    let sent = 0;
+    // One event per claim, oldest first: the lease (60 s) only has to cover a single attempt (10 s timeout), so a
+    // slow receiver cannot make another replica re-send events this one has not reached yet.
+    for (; sent < limit; sent++) {
+      const ev = (
+        await this.db.query<EventRow>(
+          `UPDATE trigger_events SET lease_until = now() + interval '60 seconds'
+           WHERE id = (
+             SELECT id FROM trigger_events
+             WHERE status = 'PENDING' AND next_attempt_at <= now() AND (lease_until IS NULL OR lease_until < now())
+             ORDER BY seq LIMIT 1 FOR UPDATE SKIP LOCKED)
+           RETURNING *`,
+        )
+      ).rows[0];
+      if (!ev) break;
+      await this.deliver(ev);
+    }
+    return sent;
   }
 
   private async deliver(ev: EventRow) {
@@ -464,23 +496,20 @@ export class TriggerService {
       body,
     );
     try {
-      const url = new URL(sub.webhook_url);
-      await assertResolvesPublic(url, this.config.TRIGGER_ALLOW_PRIVATE_WEBHOOKS);
-      const res = await fetch(url, {
-        method: 'POST',
-        redirect: 'manual',
-        signal: AbortSignal.timeout(10_000),
-        headers: {
-          'content-type': 'application/json',
+      // Re-validated on every send, and connected through a lookup that checks the very address it connects to
+      // (no second DNS resolution for a rebinding attack to slip through). Redirects are not followed.
+      const status = await postWebhook(
+        sub.webhook_url,
+        body,
+        {
           'user-agent': 'connect-hub-webhooks/1',
           'x-hub-event-id': ev.id,
           'x-hub-timestamp': timestamp,
           'x-hub-signature-256': `sha256=${signature}`,
         },
-        body,
-      });
-      await res.body?.cancel();
-      if (res.status < 200 || res.status >= 300) throw new Error(`receiver answered HTTP ${res.status}`);
+        this.config.TRIGGER_ALLOW_PRIVATE_WEBHOOKS,
+      );
+      if (status < 200 || status >= 300) throw new Error(`receiver answered HTTP ${status}`);
       await this.db.query(
         `UPDATE trigger_events SET status = 'DELIVERED', attempts = attempts + 1, delivered_at = now(),
            payload_enc = NULL, last_error = NULL, lease_until = NULL WHERE id = $1`,

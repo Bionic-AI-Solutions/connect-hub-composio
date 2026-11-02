@@ -2,7 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ADMIN_TOKEN, fakeTriggerLog, setup } from './helpers.js';
 import { signDelivery } from '../src/triggers/service.js';
-import { assertPublicWebhookUrl, isPrivateAddress } from '../src/net/url-guard.js';
+import { assertPublicWebhookUrl, guardedLookup, isPrivateAddress } from '../src/net/url-guard.js';
 
 type Ctx = Awaited<ReturnType<typeof setup>>;
 let ctx: Ctx | undefined;
@@ -10,14 +10,17 @@ let receiver: FastifyInstance;
 let receiverUrl: string;
 const received: { headers: Record<string, any>; raw: string; body: any }[] = [];
 let failNext = 0;
+let slowMs = 0;
 
 beforeEach(async () => {
   received.length = 0;
   fakeTriggerLog.length = 0;
   failNext = 0;
+  slowMs = 0;
   receiver = Fastify();
   receiver.addContentTypeParser('application/json', { parseAs: 'string' }, (_r, b, done) => done(null, b));
   receiver.post('/events', async (req, reply) => {
+    if (slowMs) await new Promise((r) => setTimeout(r, slowMs));
     if (failNext > 0) {
       failNext--;
       return reply.status(500).send('nope');
@@ -190,6 +193,26 @@ describe('triggers', () => {
     expect(subscription.status).toBe('ACTIVE');
   });
 
+  it('claims events one at a time so two replicas share a slow backlog without double delivery', async () => {
+    ctx = await setup();
+    await connect(ctx);
+    await subscribe(ctx, { user_id: 'u1', trigger: 'fake.on_event' });
+    const path = new URL(fakeTriggerLog.find((l) => l.event === 'register')!.detail as string).pathname;
+    for (let n = 1; n <= 4; n++) await ctx.app.inject({ method: 'POST', url: path, payload: { n } });
+    slowMs = 300;
+    const t0 = Date.now();
+    const [a, b] = await Promise.all([
+      ctx.services.triggers.deliverPending(),
+      ctx.services.triggers.deliverPending(),
+    ]);
+    expect(a + b).toBe(4);
+    const ids = received.map((r) => r.body.id);
+    expect(new Set(ids).size).toBe(4);
+    expect(ids).toHaveLength(4);
+    // Both replicas worked in parallel instead of one holding the whole batch.
+    expect(Date.now() - t0).toBeLessThan(4 * 300);
+  });
+
   it('isolates tenants', async () => {
     ctx = await setup();
     await connect(ctx);
@@ -243,6 +266,19 @@ describe('webhook URL guard', () => {
     expect(isPrivateAddress('::ffff:10.0.0.1')).toBe(true);
     expect(isPrivateAddress('fd00::1')).toBe(true);
     expect(isPrivateAddress('8.8.8.8')).toBe(false);
+    expect(isPrivateAddress('64:ff9b::7f00:1')).toBe(true);
+    expect(isPrivateAddress('2002:7f00:1::1')).toBe(true);
     expect(isPrivateAddress('2606:4700::1111')).toBe(false);
+  });
+
+  it('refuses at connect time when a hostname resolves to a private address (no DNS rebinding gap)', async () => {
+    const err: any = await new Promise((resolve) =>
+      guardedLookup(false)('localhost', {}, (e: unknown) => resolve(e)),
+    );
+    expect(err?.code).toBe('EPRIVATE');
+    const ok: any = await new Promise((resolve) =>
+      guardedLookup(true)('localhost', {}, (e: unknown, a: string) => resolve(e ?? a)),
+    );
+    expect(typeof ok).toBe('string');
   });
 });
