@@ -1,0 +1,716 @@
+import { createHash } from 'node:crypto';
+import type { Config } from '../config.js';
+import type { Db } from '../db/index.js';
+import { newId, randomToken, type Vault } from '../crypto/vault.js';
+import type { Registry } from '../catalog/registry.js';
+import type { AuthScheme, AuthSchemeType, ConnectionValue, Toolkit } from '../catalog/types.js';
+import { AppError, badRequest, notFound } from '../errors.js';
+
+export type AccountStatus = 'ACTIVE' | 'EXPIRED' | 'FAILED';
+
+interface AccountRow {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  toolkit: string;
+  scheme: AuthSchemeType;
+  auth_config_id: string | null;
+  status: AccountStatus;
+  credentials_enc: string | null;
+  identifier: string | null;
+  expires_at: Date | string | null;
+  last_error: string | null;
+  created_at: Date | string;
+  updated_at: Date | string;
+}
+
+interface AuthConfigRow {
+  id: string;
+  tenant_id: string;
+  toolkit: string;
+  scheme: AuthSchemeType;
+  use_platform_app: boolean;
+  client_id: string | null;
+  client_secret_enc: string | null;
+  scopes: string[] | null;
+  created_at: Date | string;
+}
+
+interface ConnectRequestRow {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  toolkit: string;
+  scheme: AuthSchemeType;
+  auth_config_id: string | null;
+  secret_enc: string;
+  redirect_url: string | null;
+  expires_at: Date | string;
+  completed_at: Date | string | null;
+  connected_account_id: string | null;
+}
+
+interface ConnectSecret {
+  codeVerifier: string;
+  /** OAuth2 connection props captured before the redirect (e.g. a subdomain). */
+  props?: Record<string, unknown>;
+}
+
+export type PublicAccount = Omit<AccountRow, 'credentials_enc'>;
+export type PublicAuthConfig = Omit<AuthConfigRow, 'client_secret_enc'> & { has_client_secret: boolean };
+
+const toIso = (d: Date | string | null) => (d == null ? null : new Date(d).toISOString());
+
+function publicAccount(r: AccountRow): PublicAccount {
+  const { credentials_enc: _omit, ...rest } = r;
+  return {
+    ...rest,
+    expires_at: toIso(r.expires_at),
+    created_at: toIso(r.created_at)!,
+    updated_at: toIso(r.updated_at)!,
+  };
+}
+
+function publicAuthConfig(r: AuthConfigRow): PublicAuthConfig {
+  const { client_secret_enc, ...rest } = r;
+  return { ...rest, created_at: toIso(r.created_at)!, has_client_secret: !!client_secret_enc };
+}
+
+function fillTemplate(url: string, props: Record<string, unknown> = {}): string {
+  return url.replace(/\{([^}]+)\}/g, (_m, name: string) => {
+    const v = props[name.trim()];
+    if (v === undefined || v === null || v === '') throw badRequest(`Missing connection field "${name}"`);
+    return encodeURIComponent(String(v));
+  });
+}
+
+export class ConnectionService {
+  private readonly refreshing = new Map<string, Promise<ConnectionValue>>();
+
+  constructor(
+    private readonly db: Db,
+    private readonly vault: Vault,
+    private readonly registry: Registry,
+    private readonly config: Config,
+  ) {}
+
+  get redirectUri(): string {
+    return `${this.config.PUBLIC_URL}/oauth/callback`;
+  }
+
+  // ───────────────────────────── toolkits & schemes ─────────────────────────────
+
+  toolkit(slug: string): Toolkit {
+    const tk = this.registry.getToolkit(slug);
+    if (!tk) throw notFound(`Toolkit "${slug}"`);
+    return tk;
+  }
+
+  scheme(tk: Toolkit, type?: string): AuthScheme {
+    if (type) {
+      const s = tk.authSchemes.find((x) => x.type === type);
+      if (!s)
+        throw badRequest(`Toolkit "${tk.slug}" does not support auth scheme ${type}`, {
+          supported: tk.authSchemes.map((x) => x.type),
+        });
+      return s;
+    }
+    const preferred =
+      tk.authSchemes.find((x) => x.type === 'OAUTH2') ??
+      tk.authSchemes.find((x) => x.type !== 'NO_AUTH') ??
+      tk.authSchemes[0];
+    if (!preferred) throw badRequest(`Toolkit "${tk.slug}" has no auth schemes`);
+    return preferred;
+  }
+
+  // ───────────────────────────── auth configs ─────────────────────────────
+
+  async createAuthConfig(
+    tenantId: string,
+    input: {
+      toolkit: string;
+      scheme?: string;
+      client_id?: string;
+      client_secret?: string;
+      scopes?: string[];
+    },
+  ): Promise<PublicAuthConfig> {
+    const tk = this.toolkit(input.toolkit);
+    const scheme = this.scheme(tk, input.scheme);
+    const own = !!input.client_id;
+    if (scheme.type === 'OAUTH2' && own && !input.client_secret)
+      throw badRequest('client_secret is required with client_id');
+    if (scheme.type !== 'OAUTH2' && (input.client_id || input.client_secret))
+      throw badRequest('client_id/client_secret only apply to OAUTH2');
+    const { rows } = await this.db.query<AuthConfigRow>(
+      `INSERT INTO auth_configs (id, tenant_id, toolkit, scheme, use_platform_app, client_id, client_secret_enc, scopes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [
+        newId('ac'),
+        tenantId,
+        tk.slug,
+        scheme.type,
+        !own,
+        input.client_id ?? null,
+        input.client_secret ? this.vault.encrypt(input.client_secret) : null,
+        input.scopes ? JSON.stringify(input.scopes) : null,
+      ],
+    );
+    return publicAuthConfig(rows[0]);
+  }
+
+  async listAuthConfigs(tenantId: string, toolkit?: string): Promise<PublicAuthConfig[]> {
+    const { rows } = await this.db.query<AuthConfigRow>(
+      `SELECT * FROM auth_configs WHERE tenant_id = $1 AND ($2::text IS NULL OR toolkit = $2) ORDER BY created_at DESC`,
+      [tenantId, toolkit ?? null],
+    );
+    return rows.map(publicAuthConfig);
+  }
+
+  async deleteAuthConfig(tenantId: string, id: string): Promise<void> {
+    const { rows } = await this.db.query(
+      'DELETE FROM auth_configs WHERE id = $1 AND tenant_id = $2 RETURNING id',
+      [id, tenantId],
+    );
+    if (!rows.length) throw notFound('Auth config');
+  }
+
+  private async oauthClient(tenantId: string, tk: Toolkit, scheme: AuthScheme, authConfigId?: string | null) {
+    let cfg: AuthConfigRow | undefined;
+    if (authConfigId) {
+      cfg = (
+        await this.db.query<AuthConfigRow>('SELECT * FROM auth_configs WHERE id = $1 AND tenant_id = $2', [
+          authConfigId,
+          tenantId,
+        ])
+      ).rows[0];
+      if (!cfg || cfg.toolkit !== tk.slug) throw notFound('Auth config');
+    } else {
+      cfg = (
+        await this.db.query<AuthConfigRow>(
+          `SELECT * FROM auth_configs WHERE tenant_id = $1 AND toolkit = $2 AND scheme = 'OAUTH2' ORDER BY created_at DESC LIMIT 1`,
+          [tenantId, tk.slug],
+        )
+      ).rows[0];
+    }
+    const scopes = cfg?.scopes?.length ? cfg.scopes : scheme.oauth2!.scopes;
+    if (cfg && !cfg.use_platform_app && cfg.client_id && cfg.client_secret_enc) {
+      return {
+        clientId: cfg.client_id,
+        clientSecret: this.vault.decrypt<string>(cfg.client_secret_enc),
+        scopes,
+        authConfigId: cfg.id,
+      };
+    }
+    const platform = this.config.platformOAuthApps[scheme.oauth2!.provider];
+    if (!platform) {
+      throw new AppError(
+        409,
+        'oauth_app_missing',
+        `No OAuth app for "${tk.slug}". Create an auth config with your own client_id/client_secret, or set OAUTH_${scheme.oauth2!.provider.toUpperCase().replace(/-/g, '_')}_CLIENT_ID/SECRET for a platform-managed app.`,
+      );
+    }
+    return {
+      clientId: platform.clientId,
+      clientSecret: platform.clientSecret,
+      scopes,
+      authConfigId: cfg?.id ?? null,
+    };
+  }
+
+  // ───────────────────────────── hosted connect flow ─────────────────────────────
+
+  private checkRedirect(url?: string) {
+    if (!url) return;
+    let u: URL;
+    try {
+      u = new URL(url);
+    } catch {
+      throw badRequest('redirect_url is not a valid URL');
+    }
+    const isLocal = u.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(u.hostname);
+    if (!isLocal && !this.config.allowedRedirectOrigins.includes(u.origin)) {
+      throw badRequest(`redirect_url origin ${u.origin} is not in ALLOWED_REDIRECT_ORIGINS`);
+    }
+  }
+
+  async createConnectLink(
+    tenantId: string,
+    input: {
+      user_id: string;
+      toolkit: string;
+      scheme?: string;
+      auth_config_id?: string;
+      redirect_url?: string;
+    },
+  ): Promise<{ id: string; connect_url: string; expires_at: string; scheme: AuthSchemeType }> {
+    if (!input.user_id) throw badRequest('user_id is required');
+    const tk = this.toolkit(input.toolkit);
+    const scheme = this.scheme(tk, input.scheme);
+    if (scheme.type === 'NO_AUTH')
+      throw badRequest(`Toolkit "${tk.slug}" needs no connection for ${scheme.type}`);
+    this.checkRedirect(input.redirect_url);
+    if (scheme.type === 'OAUTH2') await this.oauthClient(tenantId, tk, scheme, input.auth_config_id); // fail fast if no app
+    const id = newId('cr');
+    const expires = new Date(Date.now() + this.config.CONNECT_LINK_TTL_MINUTES * 60_000);
+    const secret: ConnectSecret = { codeVerifier: randomToken(48) };
+    await this.db.query(
+      `INSERT INTO connect_requests (id, tenant_id, user_id, toolkit, scheme, auth_config_id, secret_enc, redirect_url, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        id,
+        tenantId,
+        input.user_id,
+        tk.slug,
+        scheme.type,
+        input.auth_config_id ?? null,
+        this.vault.encrypt(secret),
+        input.redirect_url ?? null,
+        expires,
+      ],
+    );
+    return {
+      id,
+      connect_url: `${this.config.PUBLIC_URL}/connect/${id}?sig=${this.vault.sign(`link:${id}`)}`,
+      expires_at: expires.toISOString(),
+      scheme: scheme.type,
+    };
+  }
+
+  /** Load an open connect request; `sig` is the link signature from the URL. */
+  async openConnectRequest(
+    id: string,
+    sig: string,
+  ): Promise<{ req: ConnectRequestRow; toolkit: Toolkit; scheme: AuthScheme }> {
+    if (!sig || !this.vault.verify(`link:${id}`, sig))
+      throw new AppError(403, 'invalid_link', 'This connect link is invalid');
+    return this.loadOpenRequest(id);
+  }
+
+  private async loadOpenRequest(id: string) {
+    const req = (await this.db.query<ConnectRequestRow>('SELECT * FROM connect_requests WHERE id = $1', [id]))
+      .rows[0];
+    if (!req) throw new AppError(404, 'invalid_link', 'This connect link does not exist');
+    if (req.completed_at) throw new AppError(410, 'link_used', 'This connect link has already been used');
+    if (new Date(req.expires_at).getTime() < Date.now())
+      throw new AppError(410, 'link_expired', 'This connect link has expired');
+    const toolkit = this.toolkit(req.toolkit);
+    return { req, toolkit, scheme: this.scheme(toolkit, req.scheme) };
+  }
+
+  /** Build the provider authorize URL for an OAuth2 connect request. */
+  async authorizeUrl(id: string, sig: string, props: Record<string, unknown> = {}): Promise<string> {
+    const { req, toolkit, scheme } = await this.openConnectRequest(id, sig);
+    if (scheme.type !== 'OAUTH2' || !scheme.oauth2) throw badRequest('Not an OAuth2 connect request');
+    const missing = scheme.fields.filter(
+      (f) => f.required && (props[f.name] === undefined || props[f.name] === ''),
+    );
+    if (missing.length) throw badRequest(`Missing: ${missing.map((f) => f.displayName).join(', ')}`);
+    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc);
+    if (scheme.fields.length) {
+      secret.props = Object.fromEntries(scheme.fields.map((f) => [f.name, props[f.name]]));
+      await this.db.query('UPDATE connect_requests SET secret_enc = $1 WHERE id = $2', [
+        this.vault.encrypt(secret),
+        id,
+      ]);
+    }
+    const client = await this.oauthClient(req.tenant_id, toolkit, scheme, req.auth_config_id);
+    const o = scheme.oauth2;
+    const url = new URL(fillTemplate(o.authUrl, secret.props));
+    url.searchParams.set('client_id', client.clientId);
+    url.searchParams.set('redirect_uri', this.redirectUri);
+    url.searchParams.set('response_type', 'code');
+    if (client.scopes.length) {
+      // Slack keeps bot scopes in `scope`; the piece already embeds user_scope in the authUrl.
+      url.searchParams.set('scope', client.scopes.join(o.provider === 'facebook' ? ',' : ' '));
+    }
+    url.searchParams.set('state', `${id}.${this.vault.sign(`state:${id}`)}`);
+    for (const [k, v] of Object.entries(o.authorizeParams)) url.searchParams.set(k, v);
+    if (o.pkce) {
+      const challenge =
+        o.pkceMethod === 'plain'
+          ? secret.codeVerifier
+          : createHash('sha256').update(secret.codeVerifier).digest('base64url');
+      url.searchParams.set('code_challenge', challenge);
+      url.searchParams.set('code_challenge_method', o.pkceMethod);
+    }
+    return url.toString();
+  }
+
+  private async tokenRequest(
+    tokenUrl: string,
+    params: Record<string, string>,
+    client: { clientId: string; clientSecret: string },
+    clientAuth: 'body' | 'header',
+  ): Promise<Record<string, any>> {
+    const headers: Record<string, string> = {
+      'content-type': 'application/x-www-form-urlencoded',
+      accept: 'application/json',
+    };
+    const body = new URLSearchParams(params);
+    if (clientAuth === 'header') {
+      headers.authorization = `Basic ${Buffer.from(`${client.clientId}:${client.clientSecret}`).toString('base64')}`;
+    } else {
+      body.set('client_id', client.clientId);
+      body.set('client_secret', client.clientSecret);
+    }
+    const res = await fetch(tokenUrl, { method: 'POST', headers, body });
+    const text = await res.text();
+    let data: Record<string, any>;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = Object.fromEntries(new URLSearchParams(text));
+    }
+    if (!res.ok || data.error || data.ok === false) {
+      const reason = data.error_description || data.error || `HTTP ${res.status}`;
+      throw new AppError(
+        502,
+        data.error === 'invalid_grant' ? 'invalid_grant' : 'oauth_token_error',
+        `Token endpoint rejected the request: ${reason}`,
+      );
+    }
+    return data;
+  }
+
+  /** Complete an OAuth2 flow from the provider callback. Returns the request (for the redirect) and the account. */
+  async completeOAuth(
+    state: string,
+    code: string,
+  ): Promise<{ redirectUrl: string | null; account: PublicAccount }> {
+    const [id, sig] = String(state ?? '').split('.');
+    if (!id || !sig || !this.vault.verify(`state:${id}`, sig))
+      throw new AppError(403, 'invalid_state', 'Invalid OAuth state');
+    const { req, toolkit, scheme } = await this.loadOpenRequest(id);
+    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc);
+    const client = await this.oauthClient(req.tenant_id, toolkit, scheme, req.auth_config_id);
+    const o = scheme.oauth2!;
+    const tokenUrl = fillTemplate(o.tokenUrl, secret.props);
+    const params: Record<string, string> = {
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: this.redirectUri,
+    };
+    if (o.pkce) params.code_verifier = secret.codeVerifier;
+    const data = await this.tokenRequest(tokenUrl, params, client, o.clientAuth);
+    const accessToken = data.access_token ?? data.authed_user?.access_token;
+    if (!accessToken) throw new AppError(502, 'oauth_token_error', 'Token response had no access_token');
+    const value: ConnectionValue = {
+      type: 'OAUTH2',
+      access_token: accessToken,
+      refresh_token: data.refresh_token,
+      token_type: data.token_type,
+      expires_in: data.expires_in ? Number(data.expires_in) : undefined,
+      claimed_at: Math.floor(Date.now() / 1000),
+      scope: data.scope ?? client.scopes.join(' '),
+      client_id: client.clientId,
+      client_secret: client.clientSecret,
+      token_url: tokenUrl,
+      redirect_url: this.redirectUri,
+      data,
+      props: secret.props,
+    };
+    const account = await this.storeAccount(
+      req.tenant_id,
+      req.user_id,
+      toolkit,
+      'OAUTH2',
+      value,
+      client.authConfigId,
+    );
+    await this.markCompleted(req.id, account.id);
+    return { redirectUrl: req.redirect_url, account };
+  }
+
+  /** Complete a credential-form connect request (API key, basic auth, custom fields). */
+  async completeForm(
+    id: string,
+    sig: string,
+    fields: Record<string, unknown>,
+  ): Promise<{ redirectUrl: string | null; account: PublicAccount }> {
+    const { req, toolkit, scheme } = await this.openConnectRequest(id, sig);
+    if (scheme.type === 'OAUTH2') throw badRequest('Use the OAuth flow for this request');
+    const account = await this.createAccount(req.tenant_id, {
+      user_id: req.user_id,
+      toolkit: toolkit.slug,
+      scheme: scheme.type,
+      credentials: fields,
+    });
+    await this.markCompleted(req.id, account.id);
+    return { redirectUrl: req.redirect_url, account };
+  }
+
+  private async markCompleted(requestId: string, accountId: string) {
+    // Wipe the PKCE verifier once used.
+    await this.db.query(
+      `UPDATE connect_requests SET completed_at = now(), connected_account_id = $1, secret_enc = '' WHERE id = $2`,
+      [accountId, requestId],
+    );
+  }
+
+  // ───────────────────────────── connected accounts ─────────────────────────────
+
+  private credentialValue(scheme: AuthScheme, fields: Record<string, unknown>): ConnectionValue {
+    const missing = scheme.fields.filter(
+      (f) => f.required && (fields[f.name] === undefined || fields[f.name] === null || fields[f.name] === ''),
+    );
+    if (missing.length)
+      throw badRequest(`Missing credential field(s): ${missing.map((f) => f.name).join(', ')}`);
+    const pick = () => {
+      const out: Record<string, unknown> = {};
+      for (const f of scheme.fields) {
+        let v = fields[f.name] ?? f.defaultValue;
+        if (f.type === 'number' && typeof v === 'string' && v !== '') v = Number(v);
+        if (f.type === 'boolean' && typeof v === 'string') v = v === 'true' || v === 'on';
+        if (v !== undefined) out[f.name] = v;
+      }
+      return out;
+    };
+    switch (scheme.type) {
+      case 'SECRET_TEXT':
+        return { type: 'SECRET_TEXT', secret_text: String(fields.secret_text) };
+      case 'BASIC_AUTH':
+        return { type: 'BASIC_AUTH', username: String(fields.username), password: String(fields.password) };
+      case 'CUSTOM_AUTH':
+        return { type: 'CUSTOM_AUTH', props: pick() };
+      default:
+        throw badRequest(`Cannot create ${scheme.type} accounts from credentials`);
+    }
+  }
+
+  /** Create a non-OAuth account directly from credentials (server-to-server import). Credentials are validated first. */
+  async createAccount(
+    tenantId: string,
+    input: { user_id: string; toolkit: string; scheme?: string; credentials: Record<string, unknown> },
+  ): Promise<PublicAccount> {
+    if (!input.user_id) throw badRequest('user_id is required');
+    const tk = this.toolkit(input.toolkit);
+    const scheme = this.scheme(
+      tk,
+      input.scheme ?? tk.authSchemes.find((s) => s.type !== 'OAUTH2' && s.type !== 'NO_AUTH')?.type,
+    );
+    const value = this.credentialValue(scheme, input.credentials ?? {});
+    if (tk.validate) {
+      const res = await tk.validate(value);
+      if (!res.valid)
+        throw new AppError(
+          422,
+          'invalid_credentials',
+          res.error ?? 'Credentials were rejected by the provider',
+        );
+    }
+    return this.storeAccount(tenantId, input.user_id, tk, scheme.type, value, null);
+  }
+
+  private async storeAccount(
+    tenantId: string,
+    userId: string,
+    tk: Toolkit,
+    scheme: AuthSchemeType,
+    value: ConnectionValue,
+    authConfigId: string | null,
+  ): Promise<PublicAccount> {
+    const identifier = tk.identify ? await tk.identify(value) : undefined;
+    const expiresAt =
+      value.type === 'OAUTH2' && value.expires_in
+        ? new Date((value.claimed_at + value.expires_in) * 1000)
+        : null;
+    const { rows } = await this.db.query<AccountRow>(
+      `INSERT INTO connected_accounts (id, tenant_id, user_id, toolkit, scheme, auth_config_id, status, credentials_enc, identifier, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'ACTIVE',$7,$8,$9) RETURNING *`,
+      [
+        newId('ca'),
+        tenantId,
+        userId,
+        tk.slug,
+        scheme,
+        authConfigId,
+        this.vault.encrypt(value),
+        identifier ?? null,
+        expiresAt,
+      ],
+    );
+    return publicAccount(rows[0]);
+  }
+
+  async listAccounts(
+    tenantId: string,
+    f: { user_id?: string; toolkit?: string; status?: string } = {},
+  ): Promise<PublicAccount[]> {
+    const { rows } = await this.db.query<AccountRow>(
+      `SELECT * FROM connected_accounts WHERE tenant_id = $1
+         AND ($2::text IS NULL OR user_id = $2) AND ($3::text IS NULL OR toolkit = $3) AND ($4::text IS NULL OR status = $4)
+       ORDER BY created_at DESC LIMIT 500`,
+      [tenantId, f.user_id ?? null, f.toolkit ?? null, f.status ?? null],
+    );
+    return rows.map(publicAccount);
+  }
+
+  private async row(tenantId: string, id: string): Promise<AccountRow> {
+    const r = (
+      await this.db.query<AccountRow>('SELECT * FROM connected_accounts WHERE id = $1 AND tenant_id = $2', [
+        id,
+        tenantId,
+      ])
+    ).rows[0];
+    if (!r) throw notFound('Connected account');
+    return r;
+  }
+
+  async getAccount(tenantId: string, id: string): Promise<PublicAccount> {
+    return publicAccount(await this.row(tenantId, id));
+  }
+
+  async deleteAccount(tenantId: string, id: string): Promise<void> {
+    await this.row(tenantId, id);
+    await this.db.query('DELETE FROM connected_accounts WHERE id = $1 AND tenant_id = $2', [id, tenantId]);
+    await this.db.query('DELETE FROM kv_store WHERE tenant_id = $1 AND scope = $2', [tenantId, id]);
+  }
+
+  /**
+   * Resolve the credential to run a tool with. Picks the given account, or the user's most recent ACTIVE account for
+   * the toolkit. Refreshes OAuth tokens that expire within 5 minutes.
+   */
+  async credentialFor(
+    tenantId: string,
+    userId: string,
+    toolkitSlug: string,
+    accountId?: string,
+  ): Promise<{ account: PublicAccount; value: ConnectionValue } | null> {
+    let row: AccountRow | undefined;
+    if (accountId) {
+      row = await this.row(tenantId, accountId);
+      if (row.user_id !== userId)
+        throw new AppError(403, 'forbidden', 'Connected account belongs to a different user');
+      if (row.toolkit !== toolkitSlug)
+        throw badRequest(`Connected account is for "${row.toolkit}", not "${toolkitSlug}"`);
+    } else {
+      row = (
+        await this.db.query<AccountRow>(
+          `SELECT * FROM connected_accounts WHERE tenant_id = $1 AND user_id = $2 AND toolkit = $3 AND status = 'ACTIVE'
+           ORDER BY created_at DESC LIMIT 1`,
+          [tenantId, userId, toolkitSlug],
+        )
+      ).rows[0];
+      if (!row) return null;
+    }
+    if (row.status !== 'ACTIVE') {
+      throw new AppError(
+        409,
+        'account_not_active',
+        `Connected account ${row.id} is ${row.status}${row.last_error ? `: ${row.last_error}` : ''}. Reconnect it.`,
+      );
+    }
+    let value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+    if (
+      value.type === 'OAUTH2' &&
+      row.expires_at &&
+      new Date(row.expires_at).getTime() - Date.now() < 5 * 60_000
+    ) {
+      value = await this.refresh(row, value);
+    }
+    if (this.vault.isStale(row.credentials_enc!)) {
+      await this.db.query('UPDATE connected_accounts SET credentials_enc = $1 WHERE id = $2', [
+        this.vault.encrypt(value),
+        row.id,
+      ]);
+    }
+    return { account: publicAccount(row), value };
+  }
+
+  async forceRefresh(tenantId: string, id: string): Promise<PublicAccount> {
+    const row = await this.row(tenantId, id);
+    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+    if (value.type !== 'OAUTH2') throw badRequest('Only OAuth2 accounts can be refreshed');
+    await this.refresh(row, value);
+    return this.getAccount(tenantId, id);
+  }
+
+  private refresh(
+    row: AccountRow,
+    value: Extract<ConnectionValue, { type: 'OAUTH2' }>,
+  ): Promise<ConnectionValue> {
+    // One in-flight refresh per account per process; refresh tokens are often single-use.
+    const existing = this.refreshing.get(row.id);
+    if (existing) return existing;
+    const p = this.doRefresh(row, value).finally(() => this.refreshing.delete(row.id));
+    this.refreshing.set(row.id, p);
+    return p;
+  }
+
+  private async doRefresh(
+    row: AccountRow,
+    value: Extract<ConnectionValue, { type: 'OAUTH2' }>,
+  ): Promise<ConnectionValue> {
+    if (!value.refresh_token) {
+      await this.db.query(
+        `UPDATE connected_accounts SET status = 'EXPIRED', last_error = $1, updated_at = now() WHERE id = $2`,
+        ['Token expired and the provider issued no refresh token', row.id],
+      );
+      throw new AppError(409, 'account_not_active', `Connected account ${row.id} has expired. Reconnect it.`);
+    }
+    const tk = this.toolkit(row.toolkit);
+    const scheme = this.scheme(tk, 'OAUTH2');
+    try {
+      const data = await this.tokenRequest(
+        value.token_url,
+        { grant_type: 'refresh_token', refresh_token: value.refresh_token },
+        { clientId: value.client_id, clientSecret: value.client_secret },
+        scheme.oauth2!.clientAuth,
+      );
+      const next: ConnectionValue = {
+        ...value,
+        access_token: data.access_token ?? value.access_token,
+        refresh_token: data.refresh_token ?? value.refresh_token,
+        expires_in: data.expires_in ? Number(data.expires_in) : value.expires_in,
+        claimed_at: Math.floor(Date.now() / 1000),
+        scope: data.scope ?? value.scope,
+        data: { ...value.data, ...data },
+      };
+      const expiresAt = next.expires_in ? new Date((next.claimed_at + next.expires_in) * 1000) : null;
+      await this.db.query(
+        `UPDATE connected_accounts SET credentials_enc = $1, expires_at = $2, last_error = NULL, updated_at = now() WHERE id = $3`,
+        [this.vault.encrypt(next), expiresAt, row.id],
+      );
+      return next;
+    } catch (e) {
+      const err = e as AppError;
+      if (err.code === 'invalid_grant') {
+        await this.db.query(
+          `UPDATE connected_accounts SET status = 'EXPIRED', last_error = $1, updated_at = now() WHERE id = $2`,
+          [err.message, row.id],
+        );
+        throw new AppError(
+          409,
+          'account_not_active',
+          `Connected account ${row.id} was revoked or expired. Reconnect it.`,
+        );
+      }
+      await this.db.query(`UPDATE connected_accounts SET last_error = $1, updated_at = now() WHERE id = $2`, [
+        err.message,
+        row.id,
+      ]);
+      throw e;
+    }
+  }
+
+  /** Background job: refresh OAuth tokens expiring in the next 15 minutes. */
+  async sweepExpiring(): Promise<{ refreshed: number; failed: number }> {
+    const { rows } = await this.db.query<AccountRow>(
+      `SELECT * FROM connected_accounts WHERE status = 'ACTIVE' AND expires_at IS NOT NULL AND expires_at < now() + interval '15 minutes' LIMIT 200`,
+    );
+    let refreshed = 0;
+    let failed = 0;
+    for (const row of rows) {
+      try {
+        const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+        if (value.type !== 'OAUTH2') continue;
+        await this.refresh(row, value);
+        refreshed++;
+      } catch {
+        failed++;
+      }
+    }
+    return { refreshed, failed };
+  }
+}

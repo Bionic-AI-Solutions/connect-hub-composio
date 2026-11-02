@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: hub
+      POSTGRES_PASSWORD: hub
+      POSTGRES_DB: hub
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U hub']
+      interval: 5s
+      retries: 10
+  hub:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://hub:hub@postgres:5432/hub
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+volumes:
+  pgdata:
