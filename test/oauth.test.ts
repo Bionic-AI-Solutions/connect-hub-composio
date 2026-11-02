@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { setup } from './helpers.js';
+import { createServices } from '../src/http/app.js';
 
 type Ctx = Awaited<ReturnType<typeof setup>>;
 let ctx: Ctx | undefined;
@@ -135,6 +136,27 @@ describe('OAuth2 flow', () => {
       await ctx.app.inject({ method: 'GET', url: `/v1/connected-accounts/${rows[0].id}`, headers: ctx.auth })
     ).json();
     expect(acct.status).toBe('EXPIRED');
+  });
+
+  it('two replicas refreshing the same account at once make exactly one refresh call', async () => {
+    ctx = await setup({ withProvider: true });
+    await oauthConnect(ctx, 'u1');
+    await ctx.services.db.query(`UPDATE connected_accounts SET expires_at = now() - interval '1 minute'`);
+    ctx.provider!.state.refreshDelayMs = 300;
+    // A second "replica": separate services (own in-process caches) over the same database.
+    const replica = createServices(ctx.services.config, ctx.services.db, ctx.services.registry);
+    const run = (svc: typeof replica) =>
+      svc.executor.execute({ tenantId: ctx!.tenant.id, userId: 'u1', tool: 'mockapp.whoami' });
+    const [a, b] = await Promise.all([run(ctx.services), run(replica)]);
+    expect(a.successful).toBe(true);
+    expect(b.successful).toBe(true);
+    expect(ctx.provider!.state.refreshCount).toBe(1);
+    expect((a.data as any).token).toBe((b.data as any).token);
+    const acct = (
+      await ctx.app.inject({ method: 'GET', url: '/v1/connected-accounts?user_id=u1', headers: ctx.auth })
+    ).json().items[0];
+    expect(acct.status).toBe('ACTIVE');
+    expect(acct.refresh_lock_until).toBeUndefined();
   });
 
   it('uses a tenant-supplied OAuth app over the platform app (white-label)', async () => {

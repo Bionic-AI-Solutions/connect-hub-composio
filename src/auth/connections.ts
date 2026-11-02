@@ -63,6 +63,7 @@ const toIso = (d: Date | string | null) => (d == null ? null : new Date(d).toISO
 
 function publicAccount(r: AccountRow): PublicAccount {
   const { credentials_enc: _omit, ...rest } = r;
+  delete (rest as Record<string, unknown>).refresh_lock_until;
   return {
     ...rest,
     expires_at: toIso(r.expires_at),
@@ -622,20 +623,72 @@ export class ConnectionService {
     const row = await this.row(tenantId, id);
     const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
     if (value.type !== 'OAUTH2') throw badRequest('Only OAuth2 accounts can be refreshed');
-    await this.refresh(row, value);
+    await this.refresh(row, value, true);
     return this.getAccount(tenantId, id);
   }
 
   private refresh(
     row: AccountRow,
-    value: Extract<ConnectionValue, { type: 'OAUTH2' }>,
+    _value: Extract<ConnectionValue, { type: 'OAUTH2' }>,
+    force = false,
   ): Promise<ConnectionValue> {
-    // One in-flight refresh per account per process; refresh tokens are often single-use.
+    // One in-flight refresh per account per process (cheap), plus a database lease so replicas never refresh the
+    // same account at the same time. Refresh tokens are often single-use.
     const existing = this.refreshing.get(row.id);
     if (existing) return existing;
-    const p = this.doRefresh(row, value).finally(() => this.refreshing.delete(row.id));
+    const p = this.refreshWithLease(row.id, force).finally(() => this.refreshing.delete(row.id));
     this.refreshing.set(row.id, p);
     return p;
+  }
+
+  private static readonly LEASE_WAIT_MS = 15_000;
+
+  private async refreshWithLease(accountId: string, force: boolean): Promise<ConnectionValue> {
+    const deadline = Date.now() + ConnectionService.LEASE_WAIT_MS;
+    // A forced refresh that had to wait for another replica's refresh does not refresh again.
+    for (let attempt = 0; ; attempt++) {
+      const leased = (
+        await this.db.query<AccountRow>(
+          `UPDATE connected_accounts SET refresh_lock_until = now() + interval '30 seconds'
+           WHERE id = $1 AND (refresh_lock_until IS NULL OR refresh_lock_until < now()) RETURNING *`,
+          [accountId],
+        )
+      ).rows[0];
+      if (leased) {
+        try {
+          return await this.refreshLeased(leased, force && attempt === 0);
+        } finally {
+          await this.db.query('UPDATE connected_accounts SET refresh_lock_until = NULL WHERE id = $1', [
+            accountId,
+          ]);
+        }
+      }
+      // Another replica holds the lease: wait for it, then use whatever it stored.
+      if (Date.now() > deadline) {
+        throw new AppError(
+          503,
+          'refresh_busy',
+          'A token refresh for this account is still running; retry shortly',
+        );
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+
+  /** Runs while holding the lease, on a freshly read row (another replica may have refreshed already). */
+  private async refreshLeased(row: AccountRow, force: boolean): Promise<ConnectionValue> {
+    if (row.status !== 'ACTIVE') {
+      throw new AppError(
+        409,
+        'account_not_active',
+        `Connected account ${row.id} is ${row.status}. Reconnect it.`,
+      );
+    }
+    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+    if (value.type !== 'OAUTH2') return value;
+    const fresh = !row.expires_at || new Date(row.expires_at).getTime() - Date.now() > 5 * 60_000;
+    if (fresh && !force) return value;
+    return this.doRefresh(row, value);
   }
 
   private async doRefresh(

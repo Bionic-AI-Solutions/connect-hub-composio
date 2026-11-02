@@ -17,6 +17,10 @@ export async function startMockProvider() {
     lastTokenRequest: null as Record<string, string> | null,
     challenges: new Map<string, string>(),
     validTokens: new Set<string>(),
+    /** Refresh tokens rotate: each works once, like Atlassian's and many others. */
+    usedRefreshTokens: new Set<string>(),
+    refreshCount: 0,
+    refreshDelayMs: 0,
   };
   const app: FastifyInstance = Fastify();
   await app.register(formbody);
@@ -33,7 +37,11 @@ export async function startMockProvider() {
       if (!challenge || challenge !== expected)
         return reply.status(400).send({ error: 'invalid_grant', error_description: 'PKCE mismatch' });
     } else if (b.grant_type === 'refresh_token') {
-      if (b.refresh_token === 'revoked') return reply.status(400).send({ error: 'invalid_grant' });
+      if (b.refresh_token === 'revoked' || state.usedRefreshTokens.has(b.refresh_token))
+        return reply.status(400).send({ error: 'invalid_grant' });
+      state.usedRefreshTokens.add(b.refresh_token);
+      state.refreshCount++;
+      if (state.refreshDelayMs) await new Promise((r) => setTimeout(r, state.refreshDelayMs));
     } else {
       return reply.status(400).send({ error: 'unsupported_grant_type' });
     }
