@@ -153,7 +153,7 @@ export class ConnectionService {
         scheme.type,
         !own,
         input.client_id ?? null,
-        input.client_secret ? this.vault.encrypt(input.client_secret) : null,
+        input.client_secret ? this.vault.encrypt(input.client_secret, tenantId) : null,
         input.scopes ? JSON.stringify(input.scopes) : null,
       ],
     );
@@ -198,7 +198,7 @@ export class ConnectionService {
     if (cfg && !cfg.use_platform_app && cfg.client_id && cfg.client_secret_enc) {
       return {
         clientId: cfg.client_id,
-        clientSecret: this.vault.decrypt<string>(cfg.client_secret_enc),
+        clientSecret: this.vault.decrypt<string>(cfg.client_secret_enc, tenantId),
         scopes,
         authConfigId: cfg.id,
       };
@@ -265,7 +265,7 @@ export class ConnectionService {
         tk.slug,
         scheme.type,
         input.auth_config_id ?? null,
-        this.vault.encrypt(secret),
+        this.vault.encrypt(secret, tenantId),
         input.redirect_url ?? null,
         expires,
       ],
@@ -307,11 +307,11 @@ export class ConnectionService {
       (f) => f.required && (props[f.name] === undefined || props[f.name] === ''),
     );
     if (missing.length) throw badRequest(`Missing: ${missing.map((f) => f.displayName).join(', ')}`);
-    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc);
+    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc, req.tenant_id);
     if (scheme.fields.length) {
       secret.props = Object.fromEntries(scheme.fields.map((f) => [f.name, props[f.name]]));
       await this.db.query('UPDATE connect_requests SET secret_enc = $1 WHERE id = $2', [
-        this.vault.encrypt(secret),
+        this.vault.encrypt(secret, req.tenant_id),
         id,
       ]);
     }
@@ -385,7 +385,7 @@ export class ConnectionService {
     if (!id || !sig || !this.vault.verify(`state:${id}`, sig))
       throw new AppError(403, 'invalid_state', 'Invalid OAuth state');
     const { req, toolkit, scheme } = await this.loadOpenRequest(id);
-    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc);
+    const secret = this.vault.decrypt<ConnectSecret>(req.secret_enc, req.tenant_id);
     const client = await this.oauthClient(req.tenant_id, toolkit, scheme, req.auth_config_id);
     const o = scheme.oauth2!;
     const tokenUrl = fillTemplate(o.tokenUrl, secret.props);
@@ -528,7 +528,7 @@ export class ConnectionService {
         tk.slug,
         scheme,
         authConfigId,
-        this.vault.encrypt(value),
+        this.vault.encrypt(value, tenantId),
         identifier ?? null,
         expiresAt,
       ],
@@ -604,7 +604,7 @@ export class ConnectionService {
         `Connected account ${row.id} is ${row.status}${row.last_error ? `: ${row.last_error}` : ''}. Reconnect it.`,
       );
     }
-    let value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+    let value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!, row.tenant_id);
     if (
       value.type === 'OAUTH2' &&
       row.expires_at &&
@@ -614,7 +614,7 @@ export class ConnectionService {
     }
     if (this.vault.isStale(row.credentials_enc!)) {
       await this.db.query('UPDATE connected_accounts SET credentials_enc = $1 WHERE id = $2', [
-        this.vault.encrypt(value),
+        this.vault.encrypt(value, row.tenant_id),
         row.id,
       ]);
     }
@@ -623,7 +623,7 @@ export class ConnectionService {
 
   async forceRefresh(tenantId: string, id: string): Promise<PublicAccount> {
     const row = await this.row(tenantId, id);
-    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!, row.tenant_id);
     if (value.type !== 'OAUTH2') throw badRequest('Only OAuth2 accounts can be refreshed');
     await this.refresh(row, value, true);
     return this.getAccount(tenantId, id);
@@ -686,7 +686,7 @@ export class ConnectionService {
         `Connected account ${row.id} is ${row.status}. Reconnect it.`,
       );
     }
-    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+    const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!, row.tenant_id);
     if (value.type !== 'OAUTH2') return value;
     const fresh = !row.expires_at || new Date(row.expires_at).getTime() - Date.now() > 5 * 60_000;
     if (fresh && !force) return value;
@@ -725,7 +725,7 @@ export class ConnectionService {
       const expiresAt = next.expires_in ? new Date((next.claimed_at + next.expires_in) * 1000) : null;
       await this.db.query(
         `UPDATE connected_accounts SET credentials_enc = $1, expires_at = $2, last_error = NULL, updated_at = now() WHERE id = $3`,
-        [this.vault.encrypt(next), expiresAt, row.id],
+        [this.vault.encrypt(next, row.tenant_id), expiresAt, row.id],
       );
       return next;
     } catch (e) {
@@ -758,7 +758,7 @@ export class ConnectionService {
     let failed = 0;
     for (const row of rows) {
       try {
-        const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!);
+        const value = this.vault.decrypt<ConnectionValue>(row.credentials_enc!, row.tenant_id);
         if (value.type !== 'OAUTH2') continue;
         await this.refresh(row, value);
         refreshed++;

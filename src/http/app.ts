@@ -40,6 +40,7 @@ export interface Services {
 }
 
 export function createServices(config: Config, db: Db, registry: Registry): Services {
+  if (!config.MASTER_KEYS) throw new Error('Master keys are not resolved (call resolveMasterKeys first)');
   const vault = new Vault(config.MASTER_KEYS);
   const tenants = new TenantService(db);
   const connections = new ConnectionService(db, vault, registry, config);

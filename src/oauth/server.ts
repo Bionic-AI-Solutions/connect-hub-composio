@@ -269,7 +269,7 @@ export class McpOAuthServer {
         resource,
         server.tenantId,
         serverId,
-        this.vault.encrypt(oidcSecret),
+        this.vault.encrypt(oidcSecret, server.tenantId),
         new Date(Date.now() + REQUEST_TTL_MS),
       ],
     );
@@ -310,7 +310,7 @@ export class McpOAuthServer {
     if (!id || !sig || !this.vault.verify(`oidc:${id}`, sig))
       throw new AppError(403, 'invalid_state', 'Invalid sign-in state');
     const r = await this.openRequest(id);
-    const secret = this.vault.decrypt<{ verifier: string; nonce: string }>(r.oidc_secret_enc);
+    const secret = this.vault.decrypt<{ verifier: string; nonce: string }>(r.oidc_secret_enc, r.tenant_id);
     const who: OidcIdentity = await this.oidc.exchange(code, secret.verifier, secret.nonce);
     if (!(await this.policyAllows(r.tenant_id, who.email))) {
       throw new AppError(

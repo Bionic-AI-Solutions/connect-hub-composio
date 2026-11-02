@@ -20,7 +20,7 @@ describe('Vault', () => {
     const after = new Vault(`new:${key()},old:${oldKey}`);
     expect(after.decrypt(env)).toBe('x');
     expect(after.isStale(env)).toBe(true);
-    expect(after.isStale(after.encrypt('y'))).toBe(false);
+    expect(after.isStale(after.encrypt('y', 'ten_A'))).toBe(false);
   });
 
   it('rejects tampered ciphertext and unknown keys', () => {
@@ -41,5 +41,33 @@ describe('Vault', () => {
     const s = v.sign('state:1');
     expect(v.verify('state:1', s)).toBe(true);
     expect(v.verify('state:2', s)).toBe(false);
+  });
+});
+
+describe('tenant-scoped envelopes (v2)', () => {
+  it('only decrypts for the tenant it was written for', () => {
+    const v = new Vault(`a:${key()}`);
+    const env = v.encrypt({ token: 't' }, 'ten_A');
+    expect(env.startsWith('v2.a.')).toBe(true);
+    expect(v.decrypt(env, 'ten_A')).toEqual({ token: 't' });
+    expect(() => v.decrypt(env, 'ten_B')).toThrow();
+    expect(() => v.decrypt(env)).toThrow(/tenant/);
+  });
+
+  it('still reads v1 envelopes and marks them for re-encryption', () => {
+    const v = new Vault(`a:${key()}`);
+    const legacy = v.encrypt('old');
+    expect(v.decrypt(legacy, 'ten_A')).toBe('old');
+    expect(v.isStale(legacy)).toBe(true);
+    expect(v.isStale(v.encrypt('new', 'ten_A'))).toBe(false);
+  });
+
+  it('derives different keys per tenant and survives key rotation', () => {
+    const oldKey = key();
+    const before = new Vault(`old:${oldKey}`);
+    const env = before.encrypt('x', 'ten_A');
+    const after = new Vault(`new:${key()},old:${oldKey}`);
+    expect(after.decrypt(env, 'ten_A')).toBe('x');
+    expect(after.isStale(env)).toBe(true);
   });
 });

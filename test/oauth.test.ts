@@ -117,10 +117,10 @@ describe('OAuth2 flow', () => {
 
     // Simulate the user revoking access at the provider.
     const { rows } = await ctx.services.db.query('SELECT id, credentials_enc FROM connected_accounts');
-    const value = ctx.services.vault.decrypt<any>(rows[0].credentials_enc);
+    const value = ctx.services.vault.decrypt<any>(rows[0].credentials_enc, ctx.tenant.id);
     await ctx.services.db.query(
       `UPDATE connected_accounts SET credentials_enc = $1, expires_at = now() WHERE id = $2`,
-      [ctx.services.vault.encrypt({ ...value, refresh_token: 'revoked' }), rows[0].id],
+      [ctx.services.vault.encrypt({ ...value, refresh_token: 'revoked' }, ctx.tenant.id), rows[0].id],
     );
     const r2 = (
       await ctx.app.inject({

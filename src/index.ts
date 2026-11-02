@@ -1,4 +1,5 @@
 import { loadConfig } from './config.js';
+import { resolveMasterKeys } from './crypto/kms.js';
 import { migrate, openDb } from './db/index.js';
 import { Registry } from './catalog/registry.js';
 import { buildApp, createServices } from './http/app.js';
@@ -8,6 +9,8 @@ async function main() {
   const db = await openDb(config.DATABASE_URL);
   await migrate(db);
   const registry = Registry.default();
+  // Unwrap master keys from Vault Transit when configured, before anything touches encrypted data.
+  config.MASTER_KEYS = await resolveMasterKeys(config);
   const services = createServices(config, db, registry);
   const app = await buildApp(services);
 

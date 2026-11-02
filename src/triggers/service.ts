@@ -158,9 +158,9 @@ export class TriggerService {
     );
     return {
       auth: cred?.value,
-      config: this.vault.decrypt<Record<string, unknown>>(row.config_enc),
+      config: this.vault.decrypt<Record<string, unknown>>(row.config_enc, row.tenant_id),
       store: this.store(row.tenant_id, row.id),
-      webhookUrl: this.hookUrl(row.id, this.vault.decrypt<string>(row.hook_token_enc)),
+      webhookUrl: this.hookUrl(row.id, this.vault.decrypt<string>(row.hook_token_enc, row.tenant_id)),
       tenantId: row.tenant_id,
       publicUrl: this.config.PUBLIC_URL,
     };
@@ -221,11 +221,11 @@ export class TriggerService {
         def.toolkit,
         def.name,
         def.strategy,
-        this.vault.encrypt(input.config ?? {}),
+        this.vault.encrypt(input.config ?? {}, tenantId),
         input.webhook_url,
-        this.vault.encrypt(signingSecret),
+        this.vault.encrypt(signingSecret, tenantId),
         sha256(hookToken),
-        this.vault.encrypt(hookToken),
+        this.vault.encrypt(hookToken, tenantId),
         interval,
         def.strategy === 'POLLING' ? new Date(Date.now() + interval * 1000) : null,
         def.renews ? new Date(Date.now() + RENEW_EVERY_MS) : null,
@@ -314,7 +314,7 @@ export class TriggerService {
     for (const data of items) {
       await this.db.query(
         'INSERT INTO trigger_events (id, subscription_id, tenant_id, payload_enc) VALUES ($1,$2,$3,$4)',
-        [newId('evt'), row.id, row.tenant_id, this.vault.encrypt(data)],
+        [newId('evt'), row.id, row.tenant_id, this.vault.encrypt(data, row.tenant_id)],
       );
     }
   }
@@ -452,10 +452,14 @@ export class TriggerService {
       user_id: sub.user_id,
       connected_account_id: sub.connected_account_id,
       created_at: iso(ev.created_at),
-      data: this.vault.decrypt(ev.payload_enc),
+      data: this.vault.decrypt(ev.payload_enc, ev.tenant_id),
     });
     const timestamp = String(Math.floor(Date.now() / 1000));
-    const signature = signDelivery(this.vault.decrypt<string>(sub.signing_secret_enc), timestamp, body);
+    const signature = signDelivery(
+      this.vault.decrypt<string>(sub.signing_secret_enc, sub.tenant_id),
+      timestamp,
+      body,
+    );
     try {
       const url = new URL(sub.webhook_url);
       await assertResolvesPublic(url, this.config.TRIGGER_ALLOW_PRIVATE_WEBHOOKS);
