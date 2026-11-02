@@ -20,6 +20,12 @@ const schema = z.object({
   /** Comma-separated origins that connect links may redirect back to. Empty = any https origin is refused. */
   ALLOWED_REDIRECT_ORIGINS: z.string().default(''),
   LOG_LEVEL: z.string().default('info'),
+  /** OIDC provider people sign in with for MCP OAuth (e.g. https://keycloak.example.com/realms/bionic). */
+  OIDC_ISSUER: z.string().url().optional(),
+  OIDC_CLIENT_ID: z.string().optional(),
+  OIDC_CLIENT_SECRET: z.string().optional(),
+  MCP_OAUTH_ACCESS_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+  MCP_OAUTH_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(30),
   /** Seconds between trigger scheduler passes (polling, delivery, renewals). 0 disables the scheduler. */
   TRIGGER_TICK_SECONDS: z.coerce.number().int().nonnegative().default(10),
   /** Allow trigger webhooks to http/private addresses. Only for tests and trusted single-tenant setups. */

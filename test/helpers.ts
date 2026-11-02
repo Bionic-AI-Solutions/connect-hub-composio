@@ -210,7 +210,9 @@ export const fakePiece: ApPiece = {
   }),
 };
 
-export async function setup(opts: { withProvider?: boolean; tokenFormat?: 'form' | 'json' } = {}) {
+export async function setup(
+  opts: { withProvider?: boolean; tokenFormat?: 'form' | 'json'; env?: Record<string, string> } = {},
+) {
   const provider = opts.withProvider ? await startMockProvider() : undefined;
   const config: Config = loadConfig({
     DATABASE_URL: 'pglite:memory',
@@ -223,6 +225,7 @@ export async function setup(opts: { withProvider?: boolean; tokenFormat?: 'form'
     OAUTH_MOCKAPP_CLIENT_ID: 'mock-client',
     OAUTH_MOCKAPP_CLIENT_SECRET: 'mock-secret',
     ALLOWED_REDIRECT_ORIGINS: 'https://app.example.com',
+    ...opts.env,
   } as any);
   const db = await openDb(config.DATABASE_URL);
   await migrate(db);

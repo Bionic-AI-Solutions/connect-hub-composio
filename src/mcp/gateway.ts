@@ -140,6 +140,19 @@ export class McpService {
     if (!rows.length) throw notFound('MCP token');
   }
 
+  async getServer(serverId: string): Promise<McpServerRow | undefined> {
+    const row = (await this.db.query<McpServerRow>('SELECT * FROM mcp_servers WHERE id = $1', [serverId]))
+      .rows[0];
+    return row ? { ...row, connect_handoff: row.connect_handoff ?? 'text' } : undefined;
+  }
+
+  /** Binding for an OAuth-authorized user of a specific server. */
+  async bindingFor(tenantId: string, userId: string, serverId: string): Promise<McpBinding | undefined> {
+    const server = await this.getServer(serverId);
+    if (!server || server.tenant_id !== tenantId) return undefined;
+    return { tenantId, userId, server };
+  }
+
   async authenticate(token: string): Promise<McpBinding | undefined> {
     const parsed = parseKey(token, 'chm');
     if (!parsed) return undefined;

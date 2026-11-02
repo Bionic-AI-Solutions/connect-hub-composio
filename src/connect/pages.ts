@@ -63,3 +63,24 @@ export function connectPage(tk: Toolkit, scheme: AuthScheme, action: string, err
 export function messagePage(title: string, message: string, isError = false): string {
   return layout(title, `<h1>${esc(title)}</h1><p class="${isError ? 'err' : ''}">${esc(message)}</p>`);
 }
+
+export function consentPage(o: {
+  clientName: string;
+  redirectHost: string;
+  email: string;
+  serverName: string;
+  requestId: string;
+  consentToken: string;
+}): string {
+  const hidden = (n: string, v: string) => `<input type="hidden" name="${esc(n)}" value="${esc(v)}">`;
+  return layout(
+    'Authorize access',
+    `<h1>Authorize ${esc(o.clientName)}</h1>
+<p><strong>${esc(o.clientName)}</strong> (${esc(o.redirectHost)}) wants to use the <strong>${esc(o.serverName)}</strong> tools
+on your behalf, signed in as <strong>${esc(o.email)}</strong>. It will act with the app accounts you connect.</p>
+<form method="post" action="/oauth2/consent">${hidden('request_id', o.requestId)}${hidden('consent_token', o.consentToken)}
+<button type="submit" name="decision" value="allow">Allow</button>
+<button type="submit" name="decision" value="deny" style="background:transparent;color:var(--fg);border:1px solid var(--line)">Deny</button>
+</form>`,
+  );
+}

@@ -9,7 +9,10 @@ import { Registry } from '../catalog/registry.js';
 import { TenantService } from '../tenancy/tenants.js';
 import { ConnectionService } from '../auth/connections.js';
 import { Executor } from '../execute/executor.js';
-import { McpService } from '../mcp/gateway.js';
+import { McpService, type McpBinding } from '../mcp/gateway.js';
+import { OidcClient } from '../oauth/oidc.js';
+import { McpOAuthServer } from '../oauth/server.js';
+import { registerOAuthRoutes, registerOAuthTenantApi } from '../oauth/routes.js';
 import { TriggerService } from '../triggers/service.js';
 import { registerHookEndpoint, registerTriggerApi } from './trigger-routes.js';
 import { connectPage, messagePage } from '../connect/pages.js';
@@ -33,6 +36,7 @@ export interface Services {
   executor: Executor;
   mcp: McpService;
   triggers: TriggerService;
+  oauth: McpOAuthServer;
 }
 
 export function createServices(config: Config, db: Db, registry: Registry): Services {
@@ -42,7 +46,8 @@ export function createServices(config: Config, db: Db, registry: Registry): Serv
   const executor = new Executor(db, registry, connections, config);
   const mcp = new McpService(db, registry, executor, connections, config.PUBLIC_URL);
   const triggers = new TriggerService(db, vault, registry, connections, config);
-  return { config, db, vault, registry, tenants, connections, executor, mcp, triggers };
+  const oauth = new McpOAuthServer(db, vault, config, new OidcClient(config));
+  return { config, db, vault, registry, tenants, connections, executor, mcp, triggers, oauth };
 }
 
 function bearerToken(req: FastifyRequest): string | undefined {
@@ -140,6 +145,10 @@ export async function buildApp(
       return reply.status(201).send({ tenant, api_key: apiKey });
     });
     admin.get('/admin/tenants', async () => ({ items: await s.tenants.list() }));
+    admin.put<{ Params: { id: string }; Body: any }>('/admin/tenants/:id/sso', async (req) => {
+      if (!(await s.tenants.get(req.params.id))) throw new AppError(404, 'not_found', 'Tenant not found');
+      return s.oauth.setSsoPolicy(req.params.id, req.body ?? {});
+    });
     admin.post<{ Params: { id: string }; Body: { name?: string } }>(
       '/admin/tenants/:id/api-keys',
       async (req, reply) => {
@@ -151,6 +160,12 @@ export async function buildApp(
   });
 
   // ───────────────────────────── tenant API (/v1) ─────────────────────────────
+  // Each MCP server's own endpoint: sign in with OAuth (or use its chm_ tokens) at this URL.
+  const withUrl = <T extends { id: string }>(row: T) => ({
+    ...row,
+    url: `${s.config.PUBLIC_URL}/mcp/s/${row.id}`,
+  });
+
   app.register(async (v1) => {
     v1.addHook('onRequest', async (req) => {
       const t = bearerToken(req);
@@ -279,9 +294,11 @@ export async function buildApp(
 
     // MCP servers
     v1.post<{ Body: any }>('/v1/mcp-servers', async (req, reply) =>
-      reply.status(201).send(await s.mcp.createServer(req.tenantId!, req.body ?? ({} as any))),
+      reply.status(201).send(withUrl(await s.mcp.createServer(req.tenantId!, req.body ?? ({} as any)))),
     );
-    v1.get('/v1/mcp-servers', async (req) => ({ items: await s.mcp.listServers(req.tenantId!) }));
+    v1.get('/v1/mcp-servers', async (req) => ({
+      items: (await s.mcp.listServers(req.tenantId!)).map(withUrl),
+    }));
     v1.delete<{ Params: { id: string } }>('/v1/mcp-servers/:id', async (req, reply) => {
       await s.mcp.deleteServer(req.tenantId!, req.params.id);
       return reply.status(204).send();
@@ -297,6 +314,7 @@ export async function buildApp(
     });
 
     registerTriggerApi(v1, s.triggers);
+    registerOAuthTenantApi(v1, s.oauth);
 
     // Audit
     v1.get<{ Querystring: { user_id?: string; limit?: string } }>('/v1/audit-logs', async (req) => {
@@ -440,15 +458,7 @@ export async function buildApp(
   );
 
   // ───────────────────────────── MCP (streamable HTTP, stateless) ─────────────────────────────
-  const mcpHandler = async (req: FastifyRequest, reply: FastifyReply) => {
-    const t = bearerToken(req);
-    const binding = t ? await s.mcp.authenticate(t) : undefined;
-    if (!binding) {
-      return reply
-        .status(401)
-        .header('www-authenticate', 'Bearer')
-        .send({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
-    }
+  const serveMcp = async (binding: McpBinding, req: FastifyRequest, reply: FastifyReply) => {
     if (req.method !== 'POST') {
       return reply
         .status(405)
@@ -468,6 +478,49 @@ export async function buildApp(
     await server.connect(transport);
     await transport.handleRequest(req.raw, reply.raw, req.body);
   };
+  const unauthorizedMcp = (reply: FastifyReply, wwwAuthenticate: string) =>
+    reply
+      .status(401)
+      .header('www-authenticate', wwwAuthenticate)
+      .send({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+
+  // Token-per-user endpoint (chm_ tokens issued by the tenant).
+  const mcpHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+    const t = bearerToken(req);
+    const binding = t ? await s.mcp.authenticate(t) : undefined;
+    if (!binding) return unauthorizedMcp(reply, 'Bearer');
+    return serveMcp(binding, req, reply);
+  };
+
+  // Per-server endpoint: accepts the server's chm_ tokens or OAuth access tokens; advertises OAuth discovery.
+  const mcpServerHandler = async (
+    req: FastifyRequest<{ Params: { serverId: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const serverId = req.params.serverId;
+    const t = bearerToken(req);
+    let binding: McpBinding | undefined;
+    if (t?.startsWith('chm_')) {
+      const b = await s.mcp.authenticate(t);
+      binding = b && b.server.id === serverId ? b : undefined;
+    } else if (t) {
+      const o = await s.oauth.validateAccessToken(t, serverId);
+      binding = o ? await s.mcp.bindingFor(o.tenantId, o.userId, o.serverId) : undefined;
+    }
+    if (!binding) {
+      return unauthorizedMcp(
+        reply,
+        `Bearer realm="connect-hub", resource_metadata="${s.oauth.resourceMetadataUrl(serverId)}"${t ? ', error="invalid_token"' : ''}`,
+      );
+    }
+    return serveMcp(binding, req, reply);
+  };
+  app.post('/mcp/s/:serverId', mcpServerHandler);
+  app.get('/mcp/s/:serverId', mcpServerHandler);
+  app.delete('/mcp/s/:serverId', mcpServerHandler);
+
+  await registerOAuthRoutes(app, s);
+
   app.post('/mcp', mcpHandler);
   app.get('/mcp', mcpHandler);
   app.delete('/mcp', mcpHandler);
