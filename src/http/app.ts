@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import formbody from '@fastify/formbody';
 import rateLimit from '@fastify/rate-limit';
@@ -378,6 +381,29 @@ export async function buildApp(
       .header('x-frame-options', 'DENY')
       .header('referrer-policy', 'no-referrer')
       .send(body);
+
+  // Admin dashboard: static files, strict CSP (no inline script/style), talks to /v1 with the tenant's API key.
+  const dashDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'dashboard');
+  const dashFiles: Record<string, [string, string]> = {
+    '/dashboard': ['index.html', 'text/html; charset=utf-8'],
+    '/dashboard/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+    '/dashboard/app.css': ['app.css', 'text/css; charset=utf-8'],
+  };
+  for (const [path, [file, type]] of Object.entries(dashFiles)) {
+    const body = readFileSync(join(dashDir, file), 'utf8');
+    app.get(path, async (_req, reply) =>
+      reply
+        .header('content-type', type)
+        .header(
+          'content-security-policy',
+          "default-src 'none'; script-src 'self'; style-src 'self'; img-src https: data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        )
+        .header('x-content-type-options', 'nosniff')
+        .header('referrer-policy', 'no-referrer')
+        .header('cache-control', 'no-cache')
+        .send(body),
+    );
+  }
 
   // Landing page: people who open the bare domain should see a working service, not a 404.
   app.get('/', async (_req, reply) =>
