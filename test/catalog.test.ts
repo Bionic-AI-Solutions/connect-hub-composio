@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Registry } from '../src/catalog/registry.js';
 import { normalizeArgs, propToSchema } from '../src/catalog/activepieces.js';
 import { mcpToolName } from '../src/mcp/gateway.js';
+import { inferAnnotations } from '../src/catalog/annotations.js';
 
 describe('catalog', () => {
   const registry = Registry.default();
@@ -67,5 +68,22 @@ describe('catalog', () => {
     const hits = registry.searchTools('create issue', { toolkits: ['github'] });
     expect(hits[0].toolkit).toBe('github');
     expect(hits.some((h) => h.slug === 'github.github_create_issue')).toBe(true);
+  });
+
+  it('infers MCP risk annotations conservatively', () => {
+    const a = (action: string, displayName = action) =>
+      inferAnnotations({ action, displayName, toolkit: 'google-sheets' });
+    expect(a('list_projects')).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    expect(a('getIssueInformation', 'Get Issue Information')).toMatchObject({ readOnlyHint: true });
+    expect(a('find-or-create-row', 'Find or Create Row')).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+    });
+    expect(a('delete_comment')).toMatchObject({ destructiveHint: true });
+    expect(a('custom_api_call', 'Custom API Call')).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+    });
+    expect(a('create_issue')).toMatchObject({ readOnlyHint: false, destructiveHint: false });
   });
 });

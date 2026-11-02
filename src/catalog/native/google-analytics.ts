@@ -70,6 +70,7 @@ export const googleAnalytics = defineToolkit({
     },
     {
       name: 'run_report',
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
       displayName: 'Run report',
       description: 'Run a GA4 report: metrics broken down by dimensions over one or more date ranges.',
       inputSchema: {
@@ -111,6 +112,7 @@ export const googleAnalytics = defineToolkit({
     },
     {
       name: 'run_realtime_report',
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
       displayName: 'Run realtime report',
       description: 'Activity in the last 30 minutes.',
       inputSchema: {

@@ -13,13 +13,13 @@ afterEach(async () => {
   client = undefined;
 });
 
-async function mcpClient(c: Ctx, mode: 'direct' | 'router', userId = 'u1') {
+async function mcpClient(c: Ctx, mode: 'direct' | 'router', userId = 'u1', connect_handoff = 'text') {
   const server = (
     await c.app.inject({
       method: 'POST',
       url: '/v1/mcp-servers',
       headers: c.auth,
-      payload: { name: 'agents', toolkits: ['fake', 'stackexchange'], mode },
+      payload: { name: 'agents', toolkits: ['fake', 'stackexchange'], mode, connect_handoff },
     })
   ).json();
   const tok = (
@@ -123,6 +123,35 @@ describe('MCP gateway', () => {
     const res: any = await cl.callTool({ name: 'fake__echo', arguments: { text: 'x' } });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain('http://hub.test/connect/');
+  });
+
+  it('annotates tools so clients can classify risk', async () => {
+    ctx = await setup();
+    const { cl } = await mcpClient(ctx, 'direct');
+    client = cl;
+    const tools = Object.fromEntries((await cl.listTools()).tools.map((t) => [t.name, t]));
+    expect(tools['stackexchange__search_questions'].annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+    });
+    expect(tools['fake__echo'].annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      title: 'Echo',
+    });
+    expect(tools['hub_list_connections'].annotations?.readOnlyHint).toBe(true);
+  });
+
+  it('elicitation handoff returns a standard MCP URL elicitation (-32042) when not connected', async () => {
+    ctx = await setup();
+    const { cl } = await mcpClient(ctx, 'direct', 'new-user', 'elicitation');
+    client = cl;
+    const err: any = await cl.callTool({ name: 'fake__echo', arguments: { text: 'x' } }).catch((e) => e);
+    expect(err.code).toBe(-32042);
+    const [el] = err.data.elicitations;
+    expect(el).toMatchObject({ mode: 'url' });
+    expect(el.url).toContain('http://hub.test/connect/');
+    expect(el.elicitationId).toMatch(/^cr_/);
   });
 
   it('revoked MCP tokens stop working', async () => {

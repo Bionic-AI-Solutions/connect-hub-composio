@@ -47,17 +47,25 @@ After a hosted connect the browser is redirected to `redirect_url?status=success
 
 ## MCP
 
-| Method | Path                         | Body                                                                 |
-| ------ | ---------------------------- | -------------------------------------------------------------------- |
-| POST   | `/v1/mcp-servers`            | `{name, toolkits: [...], tools?: [...], mode: "direct" \| "router"}` |
-| GET    | `/v1/mcp-servers`            |                                                                      |
-| DELETE | `/v1/mcp-servers/:id`        |                                                                      |
-| POST   | `/v1/mcp-servers/:id/tokens` | `{user_id}` → `{id, url, token}`                                     |
-| DELETE | `/v1/mcp-tokens/:id`         | revoke                                                               |
+| Method | Path                         | Body                                                                                                           |
+| ------ | ---------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| POST   | `/v1/mcp-servers`            | `{name, toolkits: [...], tools?: [...], mode: "direct" \| "router", connect_handoff: "text" \| "elicitation"}` |
+| GET    | `/v1/mcp-servers`            |                                                                                                                |
+| DELETE | `/v1/mcp-servers/:id`        |                                                                                                                |
+| POST   | `/v1/mcp-servers/:id/tokens` | `{user_id}` → `{id, url, token}`                                                                               |
+| DELETE | `/v1/mcp-tokens/:id`         | revoke                                                                                                         |
 
 MCP endpoint: `POST /mcp` with `Authorization: Bearer chm_…` (streamable HTTP, stateless). Hub tools on every
 server: `hub_list_connections`, `hub_connect`, `hub_list_options`; router mode adds `hub_search_tools`,
 `hub_get_tool_schema`, `hub_execute`.
+
+Every tool carries MCP annotations (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+`openWorldHint`) inferred from the action name (see `src/catalog/annotations.ts`); `GET /v1/tools/:slug` returns
+them too.
+
+`connect_handoff` controls what happens when the bound user has not connected the app: `text` (default) returns
+an `isError` result containing the connect link; `elicitation` returns a JSON-RPC error `-32042`
+(URL elicitation required) with `data.elicitations[0] = {mode: "url", elicitationId, url, message}`.
 
 ## Audit
 

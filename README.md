@@ -94,3 +94,4 @@ docker compose up --build   # Postgres + hub
 - [docs/integrations.md](docs/integrations.md) — requested apps, auth type, provider setup notes
 - [docs/roadmap.md](docs/roadmap.md) — what is missing for Composio parity and for selling it as a product
 - [docs/api.md](docs/api.md) — endpoint reference
+- [docs/paperclip.md](docs/paperclip.md) — wiring the hub into Paperclip (org.baisoln.com), deployment included

@@ -13,6 +13,7 @@ import { McpService } from '../mcp/gateway.js';
 import { connectPage, messagePage } from '../connect/pages.js';
 import { AppError, badRequest, unauthorized } from '../errors.js';
 import type { Toolkit } from '../catalog/types.js';
+import { annotationsFor } from '../catalog/annotations.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -201,6 +202,7 @@ export async function buildApp(
         description: t.description,
         input_schema: t.inputSchema,
         dynamic_inputs: t.dynamicInputs,
+        annotations: annotationsFor(t),
       };
     });
     v1.post<{

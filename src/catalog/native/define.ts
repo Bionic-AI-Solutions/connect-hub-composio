@@ -1,4 +1,11 @@
-import type { AuthScheme, ConnectionValue, ExecutionContext, JsonSchema, Toolkit } from '../types.js';
+import type {
+  AuthScheme,
+  ConnectionValue,
+  ExecutionContext,
+  JsonSchema,
+  ToolAnnotations,
+  Toolkit,
+} from '../types.js';
 import { ToolInputError } from '../types.js';
 
 export interface NativeTool {
@@ -6,6 +13,7 @@ export interface NativeTool {
   displayName: string;
   description: string;
   inputSchema: JsonSchema;
+  annotations?: ToolAnnotations;
   run(args: Record<string, any>, auth: ConnectionValue | undefined, ctx: ExecutionContext): Promise<unknown>;
 }
 
@@ -49,6 +57,7 @@ export function defineToolkit(def: NativeToolkitDef): Toolkit {
       description: t.description,
       inputSchema: { additionalProperties: false, ...t.inputSchema },
       dynamicInputs: [],
+      annotations: t.annotations,
     })),
     async execute(action, args, auth, ctx) {
       const tool = byName.get(action);

@@ -34,6 +34,10 @@ inputs, `execute`, and optionally `listOptions`, `validate`, `identify`.
 - **Native toolkits** (`src/catalog/native/`) fill gaps: Stack Exchange, Cloudflare, Google Analytics (GA4).
   A native toolkit with the same slug as a piece overrides it.
 
+Every tool gets MCP annotations (`src/catalog/annotations.ts`): explicit ones from native toolkits, otherwise
+inferred from the action name. A destructive verb anywhere → destructive; a leading read verb with no write verb →
+read-only; generic escape hatches (`custom_api_call`, raw GraphQL) → destructive; everything else → write.
+
 Tool slugs are `<toolkit>.<action>` (e.g. `github.github_create_issue`); MCP names replace `.` with `__`.
 
 ## Auth

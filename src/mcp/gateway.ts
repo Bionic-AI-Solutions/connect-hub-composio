@@ -9,7 +9,14 @@
  * Both modes add hub tools for listing connections, creating connect links and fetching dynamic options.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  McpError,
+  UrlElicitationRequiredError,
+  type Tool,
+} from '@modelcontextprotocol/sdk/types.js';
+import { annotationsFor } from '../catalog/annotations.js';
 import type { Db } from '../db/index.js';
 import { constantTimeEqual, newId, sha256 } from '../crypto/vault.js';
 import { mintKey, parseKey } from '../tenancy/tenants.js';
@@ -26,6 +33,7 @@ export interface McpServerRow {
   toolkits: string[];
   tools: string[] | null;
   mode: 'direct' | 'router';
+  connect_handoff: 'text' | 'elicitation';
   created_at: string;
 }
 
@@ -42,6 +50,8 @@ export function mcpToolName(slug: string): string {
   return `${name.slice(0, 55)}_${sha256(slug).slice(0, 8)}`;
 }
 
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+
 export class McpService {
   constructor(
     private readonly db: Db,
@@ -53,7 +63,7 @@ export class McpService {
 
   async createServer(
     tenantId: string,
-    input: { name: string; toolkits: string[]; tools?: string[]; mode?: string },
+    input: { name: string; toolkits: string[]; tools?: string[]; mode?: string; connect_handoff?: string },
   ): Promise<McpServerRow> {
     if (!input.name) throw badRequest('name is required');
     if (!Array.isArray(input.toolkits) || !input.toolkits.length)
@@ -68,8 +78,11 @@ export class McpService {
     }
     const mode = input.mode ?? 'direct';
     if (!['direct', 'router'].includes(mode)) throw badRequest('mode must be direct or router');
+    const handoff = input.connect_handoff ?? 'text';
+    if (!['text', 'elicitation'].includes(handoff))
+      throw badRequest('connect_handoff must be text or elicitation');
     const { rows } = await this.db.query<McpServerRow>(
-      'INSERT INTO mcp_servers (id, tenant_id, name, toolkits, tools, mode) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      'INSERT INTO mcp_servers (id, tenant_id, name, toolkits, tools, mode, connect_handoff) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
       [
         newId('mcp'),
         tenantId,
@@ -77,6 +90,7 @@ export class McpService {
         JSON.stringify(input.toolkits),
         input.tools ? JSON.stringify(input.tools) : null,
         mode,
+        handoff,
       ],
     );
     return rows[0];
@@ -147,6 +161,7 @@ export class McpService {
         toolkits: row.toolkits,
         tools: row.tools,
         mode: row.mode,
+        connect_handoff: row.connect_handoff ?? 'text',
         created_at: row.created_at,
       },
     };
@@ -169,12 +184,19 @@ export class McpService {
         name: 'hub_list_connections',
         description: 'List the apps this user has connected (and which toolkits are available to connect).',
         inputSchema: { type: 'object', properties: {} },
+        annotations: READ_ONLY,
       },
       {
         name: 'hub_connect',
         description:
           'Create a link the user opens to connect an app account (OAuth or API key). Use when a tool fails with connection_required. Show the URL to the user.',
         inputSchema: { type: 'object', properties: { toolkit: toolkitEnum }, required: ['toolkit'] },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
       },
       {
         name: 'hub_list_options',
@@ -193,6 +215,7 @@ export class McpService {
           },
           required: ['tool', 'input'],
         },
+        annotations: READ_ONLY,
       },
     ];
     if (server.mode === 'router') {
@@ -209,11 +232,13 @@ export class McpService {
             },
             required: ['query'],
           },
+          annotations: READ_ONLY,
         },
         {
           name: 'hub_get_tool_schema',
           description: 'Get the full input schema of a tool before calling it.',
           inputSchema: { type: 'object', properties: { tool: { type: 'string' } }, required: ['tool'] },
+          annotations: READ_ONLY,
         },
         {
           name: 'hub_execute',
@@ -225,6 +250,13 @@ export class McpService {
               arguments: { type: 'object', additionalProperties: true },
             },
             required: ['tool'],
+          },
+          // Can run any tool on the server, so clients that gate by risk must treat it as the worst case.
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: true,
+            idempotentHint: false,
+            openWorldHint: true,
           },
         },
       );
@@ -250,6 +282,7 @@ export class McpService {
             name,
             description: `[${t.toolkit}] ${t.displayName}: ${t.description}`.slice(0, 1024),
             inputSchema: t.inputSchema as Tool['inputSchema'],
+            annotations: annotationsFor(t),
           });
         }
       }
@@ -287,10 +320,24 @@ export class McpService {
             user_id: b.userId,
             toolkit: tk,
           });
+          if (b.server.connect_handoff === 'elicitation') {
+            throw new UrlElicitationRequiredError(
+              [
+                {
+                  mode: 'url',
+                  elicitationId: link.id,
+                  url: link.connect_url,
+                  message: `Connect ${this.registry.getToolkit(tk)?.name ?? tk} to continue. ${res.error.message}.`,
+                },
+              ],
+              `${res.error.message}. The user must connect the app, then retry.`,
+            );
+          }
           return fail(
             `${res.error.message}. Ask the user to open this link to connect, then retry: ${link.connect_url}`,
           );
         } catch (e) {
+          if (e instanceof McpError) throw e;
           return fail(`${res.error.message}. ${(e as Error).message}`);
         }
       }
@@ -366,6 +413,7 @@ export class McpService {
         }
         return fail(`Unknown tool "${name}"`);
       } catch (e) {
+        if (e instanceof McpError) throw e; // protocol-level errors (URL elicitation) go out as JSON-RPC errors
         if (e instanceof AppError) return fail(e.message, e.details);
         return fail((e as Error).message);
       }

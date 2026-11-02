@@ -43,6 +43,14 @@ export interface AuthScheme {
 
 export type JsonSchema = Record<string, any>;
 
+export interface ToolAnnotations {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+}
+
 export interface ToolDef {
   /** Globally unique: `<toolkit>.<action>`. */
   slug: string;
@@ -53,6 +61,8 @@ export interface ToolDef {
   inputSchema: JsonSchema;
   /** Inputs whose allowed values come from the provider at runtime (call listOptions). */
   dynamicInputs: string[];
+  /** Explicit MCP annotations; inferred from the action name when absent (see annotations.ts). */
+  annotations?: ToolAnnotations;
 }
 
 /** Stored credential. Mirrors the Activepieces AppConnectionValue shapes so pieces consume it unchanged. */
