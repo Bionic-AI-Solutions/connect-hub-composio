@@ -268,8 +268,44 @@ td.actions button + button {
   display: flex;
   gap: 10px;
   align-items: center;
-  cursor: pointer;
+  flex-wrap: wrap;
   padding: 12px;
+}
+.app .grow {
+  flex: 1;
+  min-width: 0;
+}
+.app-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  width: 100%;
+}
+.logo-fallback {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: var(--code);
+  font-weight: 700;
+}
+a.button {
+  display: inline-block;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-radius: 7px;
+  padding: 5px 10px;
+  text-decoration: none;
+  font-size: 13px;
+}
+.steps {
+  padding-left: 20px;
+  display: grid;
+  gap: 14px;
+}
+.steps li > div {
+  margin-top: 6px;
 }
 .app img {
   width: 30px;

@@ -293,6 +293,22 @@ export async function buildApp(
     });
 
     // Auth configs
+    // App picker and one-time OAuth setup per provider (the dashboard's Apps page).
+    v1.get<{ Querystring: { user_id?: string } }>('/v1/apps', async (req) => ({
+      items: await s.connections.appsOverview(req.tenantId!, req.query.user_id || undefined),
+    }));
+    v1.get('/v1/oauth-providers', async (req) => ({
+      items: await s.connections.oauthProviders(req.tenantId!),
+    }));
+    v1.get<{ Params: { provider: string } }>('/v1/oauth-providers/:provider', async (req) =>
+      s.connections.oauthProvider(req.tenantId!, req.params.provider),
+    );
+    v1.put<{ Params: { provider: string }; Body: any }>('/v1/oauth-providers/:provider', async (req) =>
+      s.connections.setProviderApp(req.tenantId!, req.params.provider, req.body ?? {}),
+    );
+    v1.delete<{ Params: { provider: string } }>('/v1/oauth-providers/:provider', async (req) =>
+      s.connections.clearProviderApp(req.tenantId!, req.params.provider),
+    );
     v1.post<{ Body: any }>('/v1/auth-configs', async (req, reply) =>
       reply.status(201).send(await s.connections.createAuthConfig(req.tenantId!, req.body ?? ({} as any))),
     );
@@ -505,7 +521,14 @@ export async function buildApp(
     '/oauth/callback',
     async (req, reply) => {
       const q = req.query;
+      // A cancelled or failed sign-in goes back where it started (the dashboard), with a fixed error code only.
+      const failBack = async (code: string) => {
+        const back = q.state ? await s.connections.redirectForState(q.state) : null;
+        return back ? reply.redirect(withStatus(back, { status: 'error', error: code })) : null;
+      };
       if (q.error || !q.code) {
+        const sent = await failBack(q.error === 'access_denied' ? 'cancelled' : 'provider_error');
+        if (sent) return sent;
         return html(
           reply,
           messagePage(
@@ -528,8 +551,11 @@ export async function buildApp(
           await s.usage.branding(account.tenant_id),
         );
       } catch (e) {
-        if (e instanceof AppError)
+        if (e instanceof AppError) {
+          const sent = await failBack('connect_failed');
+          if (sent) return sent;
           return html(reply, messagePage('Connection failed', e.message, true), e.statusCode);
+        }
         throw e;
       }
     },

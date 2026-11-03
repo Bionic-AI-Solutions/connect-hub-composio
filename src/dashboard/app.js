@@ -164,6 +164,117 @@ const parseList = (s) =>
     .map((x) => x.trim())
     .filter(Boolean);
 
+// Who "Connect" stores accounts for. Kept per tab (like the API key) and cleared on sign-out, so a shared browser
+// never pre-fills someone else's identity.
+const ME = 'connect-hub.me';
+function getMe() {
+  try {
+    return sessionStorage.getItem(ME) || '';
+  } catch {
+    return '';
+  }
+}
+function setMe(v) {
+  try {
+    if (v) sessionStorage.setItem(ME, v);
+    else sessionStorage.removeItem(ME);
+  } catch {
+    /* Storage may be blocked; the field just will not be remembered. */
+  }
+}
+
+/** Guided one-time OAuth app setup for a provider: where to register, what to paste back. */
+function providerSetupCard(p, onSaved, onClose) {
+  const step = (n, title, ...body) => el('li', {}, el('strong', {}, title), ...body);
+  return el(
+    'div',
+    { class: 'card setup' },
+    el(
+      'div',
+      { class: 'head' },
+      el(
+        'div',
+        {},
+        el('h2', {}, `Set up ${p.name} sign-in`),
+        el('div', { class: 'muted' }, `Once, for: ${p.toolkits.map((t) => t.name).join(', ')}`),
+      ),
+      el('button', { class: 'ghost small', onclick: onClose }, 'Close'),
+    ),
+    el(
+      'ol',
+      { class: 'steps' },
+      step(
+        1,
+        `Create an OAuth app in ${p.name}`,
+        el(
+          'div',
+          {},
+          p.console_url
+            ? el(
+                'a',
+                { class: 'button small', href: p.console_url, target: '_blank', rel: 'noopener noreferrer' },
+                `Open ${p.name} developer console ↗`,
+              )
+            : el('span', { class: 'muted' }, 'Use the provider’s developer console.'),
+        ),
+        p.note ? el('div', { class: 'muted' }, p.note) : null,
+      ),
+      step(
+        2,
+        'Use this callback (redirect) URL',
+        el('div', {}, el('code', {}, p.callback_url), ' ', copyBtn(p.callback_url)),
+      ),
+      p.scopes.length
+        ? step(
+            3,
+            'Allow these scopes',
+            el(
+              'div',
+              {},
+              p.scopes.map((x) => el('span', { class: 'chip' }, x)),
+            ),
+          )
+        : null,
+      step(
+        p.scopes.length ? 4 : 3,
+        'Paste the app’s client ID and secret',
+        form(
+          async (fd) => {
+            const r = await guard(
+              () =>
+                api('PUT', `/v1/oauth-providers/${encodeURIComponent(p.provider)}`, {
+                  client_id: fd.get('client_id'),
+                  client_secret: fd.get('client_secret'),
+                }),
+              `${p.name} sign-in saved`,
+            );
+            if (r) await onSaved(r);
+          },
+          el(
+            'div',
+            { class: 'row' },
+            field(
+              'Client ID',
+              el('input', {
+                name: 'client_id',
+                required: true,
+                value: p.client_id || '',
+                autocomplete: 'off',
+              }),
+            ),
+            field(
+              'Client secret',
+              el('input', { name: 'client_secret', type: 'password', required: true, autocomplete: 'off' }),
+            ),
+          ),
+          el('div', { class: 'muted' }, 'The secret is encrypted and never shown again.'),
+          el('button', { type: 'submit' }, 'Save'),
+        ),
+      ),
+    ),
+  );
+}
+
 // ───────────────────────────── views ─────────────────────────────
 
 const views = {
@@ -219,33 +330,120 @@ const views = {
   },
 
   async apps(v) {
-    const { items } = await api('GET', '/v1/toolkits');
-    const detail = el('div');
+    const me = getMe();
+    const [{ items }, { items: providers }] = await Promise.all([
+      api('GET', `/v1/apps${me ? `?user_id=${encodeURIComponent(me)}` : ''}`),
+      api('GET', '/v1/oauth-providers'),
+    ]);
+    const byProvider = new Map(providers.map((p) => [p.provider, p]));
+    // Counts are for the person connecting; without one, show no one's.
+    if (!me) for (const app of items) app.accounts = { active: 0, needs_attention: 0 };
+    const panel = el('div');
     const grid = el('div', { class: 'grid-apps' });
+
+    const connect = async (app, scheme) => {
+      const user = getMe();
+      if (!user) {
+        toast('Enter who you are connecting as first.', true);
+        $('#me-input')?.focus();
+        return;
+      }
+      const r = await guard(() =>
+        api('POST', '/v1/connected-accounts/link', {
+          user_id: user,
+          toolkit: app.slug,
+          scheme,
+          redirect_url: `${location.origin}/dashboard#apps`,
+        }),
+      );
+      // Same tab: the provider's sign-in page, then straight back here. The API key stays in this tab's session.
+      if (r) location.assign(r.connect_url);
+    };
+    const statusLine = (app) => {
+      if (app.accounts.active)
+        return el(
+          'span',
+          { class: 'status-ACTIVE' },
+          `Connected${app.accounts.active > 1 ? ` (${app.accounts.active})` : ''}`,
+        );
+      if (app.accounts.needs_attention) return el('span', { class: 'status-EXPIRED' }, 'Needs sign-in again');
+      if (needsSignInSetup(app)) return el('span', { class: 'muted' }, 'Sign-in not set up yet');
+      if (app.connect === 'none') return el('span', { class: 'muted' }, 'No sign-in needed');
+      return el('span', { class: 'muted' }, 'Not connected');
+    };
+    const needsSignInSetup = (app) => app.oauth_provider && app.oauth_source === 'none';
+    const primary = (app) => {
+      if (app.connect === 'none') return null;
+      if (needsSignInSetup(app))
+        return el(
+          'button',
+          { class: 'small', onclick: () => showSetup(byProvider.get(app.oauth_provider), app) },
+          'Set up sign-in',
+        );
+      return el(
+        'button',
+        { class: app.accounts.active ? 'ghost small' : 'small', onclick: () => connect(app) },
+        app.accounts.active ? 'Connect another' : app.accounts.needs_attention ? 'Reconnect' : 'Connect',
+      );
+    };
+    const secondary = (app) =>
+      needsSignInSetup(app) && app.other_schemes.length
+        ? el(
+            'button',
+            {
+              class: 'ghost small',
+              title: 'Connect with an API key or service account instead',
+              onclick: () => connect(app, app.other_schemes[0]),
+            },
+            'Use a key instead',
+          )
+        : null;
     const render = (q) => {
       grid.replaceChildren(
         ...items
           .filter((t) => !q || `${t.slug} ${t.name}`.toLowerCase().includes(q.toLowerCase()))
-          .map((t) =>
+          .map((app) =>
             el(
               'div',
-              { class: 'card app', onclick: () => showApp(t.slug) },
-              t.logo_url ? el('img', { src: t.logo_url, alt: '' }) : null,
+              { class: 'card app' },
+              app.logo_url
+                ? el('img', { src: app.logo_url, alt: '' })
+                : el('div', { class: 'logo-fallback' }, app.name[0]),
+              el('div', { class: 'grow' }, el('div', { class: 'name' }, app.name), statusLine(app)),
               el(
                 'div',
-                {},
-                el('div', { class: 'name' }, t.name),
-                el('div', { class: 'muted' }, `${t.tool_count} tools · ${t.auth_schemes.join(', ')}`),
+                { class: 'app-actions' },
+                primary(app),
+                secondary(app),
+                el('button', { class: 'ghost small', onclick: () => showDetail(app) }, 'Details'),
               ),
             ),
           ),
       );
     };
-    const showApp = async (slug) => {
-      const t = await guard(() => api('GET', `/v1/toolkits/${encodeURIComponent(slug)}`));
+
+    // One-time OAuth app for a whole provider (Google covers Gmail, Drive, Sheets…). After this, Connect is one click.
+    const showSetup = (p, app) => {
+      if (!p) return;
+      panel.replaceChildren(
+        providerSetupCard(
+          p,
+          async () => {
+            panel.replaceChildren();
+            await route();
+            if (app) toast(`${p.name} sign-in is ready. Click Connect on ${app.name}.`);
+          },
+          () => panel.replaceChildren(),
+        ),
+      );
+      panel.scrollIntoView({ behavior: 'smooth' });
+    };
+
+    const showDetail = async (app) => {
+      const t = await guard(() => api('GET', `/v1/toolkits/${encodeURIComponent(app.slug)}`));
       if (!t) return;
       const result = el('div');
-      detail.replaceChildren(
+      panel.replaceChildren(
         el(
           'div',
           { class: 'card' },
@@ -253,7 +451,7 @@ const views = {
             'div',
             { class: 'head' },
             el('div', {}, el('h2', {}, t.name), el('div', { class: 'muted' }, t.description)),
-            el('button', { class: 'ghost small', onclick: () => detail.replaceChildren() }, 'Close'),
+            el('button', { class: 'ghost small', onclick: () => panel.replaceChildren() }, 'Close'),
           ),
           el(
             'div',
@@ -261,10 +459,11 @@ const views = {
             'Sign-in: ',
             t.auth_schemes.map((s) => el('span', { class: 'chip' }, s.display_name || s.type)),
           ),
+          el('h2', { class: 'mt' }, 'Connect someone else'),
           form(
             async (fd) => {
               const r = await guard(() =>
-                api('POST', '/v1/connected-accounts/link', { user_id: fd.get('user_id'), toolkit: slug }),
+                api('POST', '/v1/connected-accounts/link', { user_id: fd.get('user_id'), toolkit: app.slug }),
               );
               if (r)
                 result.replaceChildren(
@@ -281,11 +480,11 @@ const views = {
               'div',
               { class: 'row' },
               field(
-                'Create a connect link for user',
+                'Their email or user ID',
                 el('input', { name: 'user_id', placeholder: 'person@company.com', required: true }),
               ),
             ),
-            el('button', { type: 'submit' }, 'Create link'),
+            el('button', { type: 'submit', class: 'ghost' }, 'Create link'),
           ),
           result,
           el('h2', { class: 'mt' }, `Tools (${t.tools.length})`),
@@ -295,8 +494,30 @@ const views = {
           ),
         ),
       );
-      detail.scrollIntoView({ behavior: 'smooth' });
+      panel.scrollIntoView({ behavior: 'smooth' });
     };
+
+    const meForm = form(
+      async (fd) => {
+        setMe(String(fd.get('me') || '').trim());
+        await route();
+      },
+      el(
+        'div',
+        { class: 'row' },
+        field(
+          'Connecting as',
+          el('input', {
+            id: 'me-input',
+            name: 'me',
+            value: me || '',
+            placeholder: 'you@company.com',
+            required: true,
+          }),
+        ),
+      ),
+      el('button', { type: 'submit', class: 'ghost' }, me ? 'Change' : 'Save'),
+    );
     v.append(
       el(
         'div',
@@ -305,15 +526,25 @@ const views = {
           'div',
           {},
           el('h1', {}, 'Apps'),
-          el('div', { class: 'muted' }, `${items.length} toolkits available`),
+          el(
+            'div',
+            { class: 'muted' },
+            'Click an app, sign in, and the hub keeps the connection. Agents then act as this user.',
+          ),
         ),
       ),
       el(
         'div',
         { class: 'card' },
-        el('input', { placeholder: 'Search apps…', oninput: (e) => render(e.target.value) }),
+        meForm,
+        el(
+          'div',
+          { class: 'muted' },
+          'Use the same email you sign in to Paperclip with, so its agents find these connections.',
+        ),
+        el('input', { class: 'mt', placeholder: 'Search apps…', oninput: (e) => render(e.target.value) }),
       ),
-      detail,
+      panel,
       grid,
     );
     render('');
@@ -709,104 +940,134 @@ const views = {
   },
 
   async authConfigs(v) {
-    const [{ items: toolkits }, configs] = await Promise.all([
-      api('GET', '/v1/toolkits'),
+    const [{ items: providers }, configs] = await Promise.all([
+      api('GET', '/v1/oauth-providers'),
       api('GET', '/v1/auth-configs'),
     ]);
-    const oauthKits = toolkits.filter((t) => t.auth_schemes.includes('OAUTH2'));
+    const panel = el('div');
+    const label = (p) =>
+      p.source === 'tenant'
+        ? el('span', { class: 'status-ACTIVE' }, 'Your app')
+        : p.source === 'partial'
+          ? el(
+              'span',
+              { class: 'status-EXPIRED' },
+              `Your app on ${p.toolkits.filter((t) => t.uses_own_app).length} of ${p.toolkits.length}`,
+            )
+          : p.source === 'platform'
+            ? el('span', { class: 'status-ACTIVE' }, 'Platform app')
+            : el('span', { class: 'status-EXPIRED' }, 'Not set up');
+    // Per-app settings made through the API (custom scopes, a pinned platform app) stay visible and removable here.
+    const custom = configs.items.filter((c) => (c.scopes && c.scopes.length) || c.scheme !== 'OAUTH2');
+    // append() would turn null into the text "null".
     v.append(
-      el(
-        'div',
-        { class: 'head' },
+      ...[
         el(
           'div',
-          {},
-          el('h1', {}, 'OAuth apps'),
+          { class: 'head' },
           el(
             'div',
-            { class: 'muted' },
-            'Use your own OAuth app for an app so consent screens show your brand. Without one, the platform app is used.',
+            {},
+            el('h1', {}, 'Sign-in setup'),
+            el(
+              'div',
+              { class: 'muted' },
+              'Set each provider up once. Everyone in this tenant then connects its apps by signing in, with no keys to paste.',
+            ),
           ),
         ),
-      ),
-      el(
-        'div',
-        { class: 'card' },
-        table(
-          ['App', 'Type', 'Client ID', 'Scopes', 'Created', ''],
-          configs.items.map((c) => [
-            c.toolkit,
-            c.use_platform_app ? 'platform app' : 'your app',
-            c.client_id ? el('code', {}, c.client_id) : '—',
-            (c.scopes || []).map((s) => el('span', { class: 'chip' }, s)),
-            fmt(c.created_at),
-            actions(
-              el(
-                'button',
-                {
-                  class: 'danger small',
-                  onclick: async () =>
-                    confirm('Delete this OAuth app configuration?') &&
-                    (await guard(() => api('DELETE', `/v1/auth-configs/${c.id}`), 'Deleted')) !== undefined &&
-                    route(),
-                },
-                'Delete',
-              ),
-            ),
-          ]),
-          'Using platform OAuth apps for everything.',
-        ),
-      ),
-      el(
-        'div',
-        { class: 'card' },
-        el('h2', {}, 'Add your OAuth app'),
+        panel,
         el(
-          'p',
-          { class: 'muted' },
-          `Redirect URI to register with the provider: ${location.origin}/oauth/callback`,
-        ),
-        form(
-          async (fd, f) => {
-            const r = await guard(
-              () =>
-                api('POST', '/v1/auth-configs', {
-                  toolkit: fd.get('toolkit'),
-                  client_id: fd.get('client_id') || undefined,
-                  client_secret: fd.get('client_secret') || undefined,
-                  scopes: parseList(fd.get('scopes')).length ? parseList(fd.get('scopes')) : undefined,
-                }),
-              'Saved',
-            );
-            if (r) {
-              f.reset();
-              route();
-            }
-          },
-          el(
-            'div',
-            { class: 'row' },
-            field(
-              'App',
-              el(
-                'select',
-                { name: 'toolkit', required: true },
-                oauthKits.map((t) => el('option', { value: t.slug }, t.name)),
+          'div',
+          { class: 'card' },
+          table(
+            ['Provider', 'Apps', 'Sign-in', ''],
+            providers.map((p) => [
+              el('strong', {}, p.name),
+              p.toolkits.map((t) => el('span', { class: 'chip' }, t.name)),
+              label(p),
+              actions(
+                el(
+                  'button',
+                  {
+                    class: p.source === 'none' ? 'small' : 'ghost small',
+                    onclick: () => {
+                      panel.replaceChildren(
+                        providerSetupCard(
+                          p,
+                          () => route(),
+                          () => panel.replaceChildren(),
+                        ),
+                      );
+                      panel.scrollIntoView({ behavior: 'smooth' });
+                    },
+                  },
+                  p.source === 'none'
+                    ? 'Set up'
+                    : p.source === 'tenant'
+                      ? 'Change'
+                      : p.source === 'partial'
+                        ? 'Use for all apps'
+                        : 'Use your own app',
+                ),
+                p.source === 'tenant' || p.source === 'partial'
+                  ? el(
+                      'button',
+                      {
+                        class: 'danger small',
+                        onclick: async () =>
+                          confirm(
+                            `Remove your ${p.name} app? Sign-in falls back to the platform app if there is one.`,
+                          ) &&
+                          (await guard(
+                            () => api('DELETE', `/v1/oauth-providers/${encodeURIComponent(p.provider)}`),
+                            'Removed',
+                          )) !== undefined &&
+                          route(),
+                      },
+                      'Remove',
+                    )
+                  : null,
               ),
-            ),
-            field('Client ID', el('input', { name: 'client_id', required: true })),
-            field(
-              'Client secret',
-              el('input', { name: 'client_secret', type: 'password', required: true, autocomplete: 'off' }),
-            ),
-            field(
-              'Scopes (optional, overrides defaults)',
-              el('input', { name: 'scopes', placeholder: 'space or comma separated' }),
-            ),
+            ]),
+            'No apps here use OAuth sign-in.',
           ),
-          el('button', { type: 'submit' }, 'Save'),
         ),
-      ),
+        custom.length
+          ? el(
+              'div',
+              { class: 'card' },
+              el('h2', {}, 'Per-app settings'),
+              el(
+                'p',
+                { class: 'muted' },
+                'Made through the API. Saving a provider above keeps their scopes.',
+              ),
+              table(
+                ['App', 'Sign-in', 'Scopes', ''],
+                custom.map((c) => [
+                  c.toolkit,
+                  c.scheme !== 'OAUTH2' ? c.scheme : c.use_platform_app ? 'platform app' : 'your app',
+                  (c.scopes || []).map((x) => el('span', { class: 'chip' }, x)),
+                  actions(
+                    el(
+                      'button',
+                      {
+                        class: 'danger small',
+                        onclick: async () =>
+                          confirm(`Delete this ${c.toolkit} setting?`) &&
+                          (await guard(() => api('DELETE', `/v1/auth-configs/${c.id}`), 'Deleted')) !==
+                            undefined &&
+                          route(),
+                      },
+                      'Delete',
+                    ),
+                  ),
+                ]),
+              ),
+            )
+          : null,
+      ].filter(Boolean),
     );
   },
 
@@ -968,7 +1229,7 @@ const NAV = [
   ['accounts', 'Connected accounts'],
   ['servers', 'MCP servers'],
   ['triggers', 'Triggers'],
-  ['authConfigs', 'OAuth apps'],
+  ['authConfigs', 'Sign-in setup'],
   ['settings', 'Settings'],
   ['audit', 'Audit log'],
 ];
@@ -1008,6 +1269,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('hashchange', route);
   $('#logout').addEventListener('click', () => {
     setKey(null);
+    setMe('');
     showLogin();
   });
   $('#login-form').addEventListener('submit', async (ev) => {
@@ -1023,6 +1285,23 @@ document.addEventListener('DOMContentLoaded', () => {
       if (e.message !== 'unauthorized') showLogin(e.message);
     }
   });
+  const back = new URLSearchParams(location.search);
+  if (back.has('status')) {
+    history.replaceState(null, '', location.pathname + location.hash);
+    const messages = {
+      cancelled: 'Sign-in was cancelled. Nothing was connected.',
+      provider_error: 'The app did not finish sign-in. Try again.',
+      connect_failed: 'The connection could not be saved. Try again.',
+    };
+    // Only fixed text: the address bar is attacker-controllable.
+    if (back.get('status') === 'success')
+      setTimeout(() => toast('Connected. The hub keeps this connection for you.'), 300);
+    else
+      setTimeout(
+        () => toast(messages[back.get('error')] || 'The connection did not complete. Try again.', true),
+        300,
+      );
+  }
   if (memKey) showApp();
   else showLogin();
 });
