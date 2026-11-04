@@ -45,6 +45,7 @@ type ApAction = {
   name: string;
   displayName: string;
   description?: string;
+  classification?: string;
   props: Record<string, ApProp>;
   run(ctx: unknown): Promise<unknown>;
 };
@@ -524,6 +525,11 @@ function pieceTriggers(
   };
 }
 
+const CLASSIFICATIONS = new Set(['READ', 'SEARCH', 'WRITE', 'DESTRUCTIVE']);
+function isClassification(v: unknown): v is NonNullable<ToolDef['classification']> {
+  return typeof v === 'string' && CLASSIFICATIONS.has(v);
+}
+
 export function pieceToToolkit(slug: string, piece: ApPiece, version?: string): Toolkit {
   const actions = piece.actions();
   const triggers = pieceTriggers(slug, piece);
@@ -537,6 +543,7 @@ export function pieceToToolkit(slug: string, piece: ApPiece, version?: string): 
     dynamicInputs: Object.entries(a.props)
       .filter(([, p]) => DYNAMIC_TYPES.has(p.type))
       .map(([n]) => n),
+    ...(isClassification(a.classification) ? { classification: a.classification } : {}),
   }));
 
   const getAction = (name: string): ApAction => {

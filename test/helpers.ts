@@ -207,6 +207,21 @@ export const fakePiece: ApPiece = {
         return { secret: ctx.auth.secret_text, props: ctx.propsValue, count };
       },
     },
+    // No read or destructive verb in the names: only the piece's own label classifies them.
+    peek: {
+      name: 'peek',
+      displayName: 'Peek',
+      classification: 'SEARCH',
+      props: {},
+      run: async () => ({ peeked: true }),
+    },
+    zap: {
+      name: 'zap',
+      displayName: 'Zap',
+      classification: 'DESTRUCTIVE',
+      props: {},
+      run: async () => ({ zapped: true }),
+    },
   }),
 };
 

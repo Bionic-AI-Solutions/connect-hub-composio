@@ -65,6 +65,8 @@ export interface ToolDef {
   dynamicInputs: string[];
   /** Explicit MCP annotations; inferred from the action name when absent (see annotations.ts). */
   annotations?: ToolAnnotations;
+  /** The piece's own label for the action, when it has one (Activepieces `classification`). */
+  classification?: 'READ' | 'SEARCH' | 'WRITE' | 'DESTRUCTIVE';
 }
 
 /** Stored credential. Mirrors the Activepieces AppConnectionValue shapes so pieces consume it unchanged. */

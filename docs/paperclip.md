@@ -20,9 +20,11 @@ aggregator adapter that brings back those screens is on the roadmap.
 | Tool risk (read / write / destructive)   | MCP annotations on every tool (`readOnlyHint`, `destructiveHint`)      |
 | Authorization pending                    | MCP URL elicitation (JSON-RPC `-32042`) carrying the hub connect link  |
 
-Use `direct` mode for Paperclip so each tool is a separate catalog entry that Paperclip can review, allow or
-block. Avoid `router` mode here: its `hub_execute` tool can run any tool, so Paperclip can only govern it as one
-destructive tool.
+`direct` mode makes each tool a separate catalog entry that Paperclip can review, allow or block. `router` mode
+keeps the catalog small: `hub_read` runs only read-only tools, `hub_execute` only non-destructive ones and
+`hub_execute_destructive` only destructive ones, so Paperclip governs reads, writes and deletes by tool name and
+matches the app on the `tool` argument (`deploy/scripts/setup-connecthub-governance.sh` in the Paperclip repo). In router mode only `hub_connect` creates a connect link (a
+call to an unconnected app fails with "call hub_connect"), so a policy on `hub_connect` governs connecting apps.
 
 Create Paperclip-facing servers with `connect_handoff: "elicitation"`. When a user has not connected the app,
 the tool call fails with a standard URL elicitation, which Paperclip shows to the responsible person as an

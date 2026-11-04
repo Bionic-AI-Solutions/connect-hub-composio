@@ -254,8 +254,10 @@ export class McpService {
           annotations: READ_ONLY,
         },
         {
-          name: 'hub_execute',
-          description: 'Execute a tool by slug with arguments matching its input schema.',
+          name: 'hub_read',
+          description:
+            'Run a read-only tool by slug (one the hub marks read-only, e.g. list, get, search). ' +
+            'Refuses any tool that can change data; use hub_execute for those.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -264,7 +266,43 @@ export class McpService {
             },
             required: ['tool'],
           },
-          // Can run any tool on the server, so clients that gate by risk must treat it as the worst case.
+          // Only runs tools whose own annotations say read-only, so clients can treat it as a read.
+          annotations: READ_ONLY,
+        },
+        {
+          name: 'hub_execute',
+          description:
+            'Execute a tool by slug with arguments matching its input schema. ' +
+            'Refuses destructive tools (delete, remove, archive, raw API calls, ...); use hub_execute_destructive for those.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              tool: { type: 'string' },
+              arguments: { type: 'object', additionalProperties: true },
+            },
+            required: ['tool'],
+          },
+          // Never runs a tool the hub marks destructive, so clients can treat it as a write.
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: true,
+          },
+        },
+        {
+          name: 'hub_execute_destructive',
+          description:
+            'Execute a destructive tool by slug (one the hub marks destructive: delete, remove, archive, raw API ' +
+            'calls, ...). Refuses every other tool; use hub_execute or hub_read for those.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              tool: { type: 'string' },
+              arguments: { type: 'object', additionalProperties: true },
+            },
+            required: ['tool'],
+          },
           annotations: {
             readOnlyHint: false,
             destructiveHint: true,
@@ -328,6 +366,12 @@ export class McpService {
       if (res.successful) return ok(res.data ?? { ok: true });
       if (res.error?.code === 'connection_required') {
         const tk = bySlug.get(slug)!.toolkit;
+        // Router mode: only hub_connect creates a connect link, so a client that gates connecting an app
+        // (Paperclip asks the board on hub_connect) cannot be bypassed by calling an unconnected app.
+        if (b.server.mode === 'router')
+          return fail(
+            `${res.error.message}. Call hub_connect with toolkit "${tk}" to connect it, then retry.`,
+          );
         try {
           const link = await this.connections.createConnectLink(b.tenantId, {
             user_id: b.userId,
@@ -415,9 +459,29 @@ export class McpService {
               dynamic_inputs: t.dynamicInputs,
             });
           }
-          case 'hub_execute': {
+          case 'hub_read':
+          case 'hub_execute':
+          case 'hub_execute_destructive': {
             if (b.server.mode !== 'router') break;
-            return await run(String(args.tool), args.arguments ?? {});
+            // Policies upstream (e.g. Paperclip) match the slug as a string; anything else must not run.
+            if (typeof args.tool !== 'string' || !args.tool) return fail('"tool" must be a tool slug string');
+            const t = bySlug.get(args.tool);
+            if (!t) return fail(`Tool "${args.tool}" is not available on this MCP server`);
+            // Each router tool runs exactly one risk class, so clients can govern by tool name.
+            const a = annotationsFor(t);
+            const kind =
+              a.readOnlyHint === true ? 'read' : a.destructiveHint === true ? 'destructive' : 'write';
+            if (name === 'hub_read' && kind !== 'read')
+              return fail(
+                `Tool "${args.tool}" can change data, so hub_read will not run it; use ${kind === 'destructive' ? 'hub_execute_destructive' : 'hub_execute'}`,
+              );
+            if (name === 'hub_execute' && kind === 'destructive')
+              return fail(`Tool "${args.tool}" is destructive; use hub_execute_destructive`);
+            if (name === 'hub_execute_destructive' && kind !== 'destructive')
+              return fail(
+                `Tool "${args.tool}" is not destructive; use ${kind === 'read' ? 'hub_read' : 'hub_execute'}`,
+              );
+            return await run(t.slug, args.arguments ?? {});
           }
           default: {
             const t = b.server.mode === 'direct' ? byMcpName.get(name) : undefined;
