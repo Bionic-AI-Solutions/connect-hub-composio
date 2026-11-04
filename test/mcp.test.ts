@@ -100,7 +100,9 @@ describe('MCP gateway', () => {
     const { cl } = await mcpClient(ctx, 'router');
     client = cl;
     const names = (await cl.listTools()).tools.map((t) => t.name);
-    expect(names).toEqual(expect.arrayContaining(['hub_search_tools', 'hub_get_tool_schema', 'hub_execute']));
+    expect(names).toEqual(
+      expect.arrayContaining(['hub_search_tools', 'hub_get_tool_schema', 'hub_read', 'hub_execute']),
+    );
     expect(names).not.toContain('fake__echo');
 
     const hits = text(await cl.callTool({ name: 'hub_search_tools', arguments: { query: 'echo' } }));
@@ -114,6 +116,38 @@ describe('MCP gateway', () => {
       }),
     );
     expect(out.props.text).toBe('routed');
+  });
+
+  it('hub_read runs only read-only tools, and both router tools require a string slug', async () => {
+    ctx = await setup();
+    await connectFake(ctx, 'u1');
+    const { cl } = await mcpClient(ctx, 'router');
+    client = cl;
+    const tools = Object.fromEntries((await cl.listTools()).tools.map((t) => [t.name, t]));
+    // Clients (e.g. Paperclip) can classify hub_read as a read and hub_execute as the worst case.
+    expect(tools['hub_read'].annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    expect(tools['hub_execute'].annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+
+    // fake.echo is not read-only, so hub_read refuses it (hub_execute would run it).
+    const refused: any = await cl.callTool({
+      name: 'hub_read',
+      arguments: { tool: 'fake.echo', arguments: { text: 'x' } },
+    });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain('can change data');
+    const missing: any = await cl.callTool({ name: 'hub_read', arguments: { tool: 'fake.nope' } });
+    expect(missing.isError).toBe(true);
+    expect(missing.content[0].text).toContain('not available');
+
+    // A non-string slug must not run: upstream policies match the slug as a string.
+    for (const name of ['hub_execute', 'hub_read']) {
+      const bad: any = await cl.callTool({
+        name,
+        arguments: { tool: ['fake.echo'], arguments: { text: 'x' } },
+      });
+      expect(bad.isError).toBe(true);
+      expect(bad.content[0].text).toContain('must be a tool slug string');
+    }
   });
 
   it('returns a connect link when the user has not connected the app', async () => {

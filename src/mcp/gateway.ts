@@ -254,6 +254,22 @@ export class McpService {
           annotations: READ_ONLY,
         },
         {
+          name: 'hub_read',
+          description:
+            'Run a read-only tool by slug (one the hub marks read-only, e.g. list, get, search). ' +
+            'Refuses any tool that can change data; use hub_execute for those.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              tool: { type: 'string' },
+              arguments: { type: 'object', additionalProperties: true },
+            },
+            required: ['tool'],
+          },
+          // Only runs tools whose own annotations say read-only, so clients can treat it as a read.
+          annotations: READ_ONLY,
+        },
+        {
           name: 'hub_execute',
           description: 'Execute a tool by slug with arguments matching its input schema.',
           inputSchema: {
@@ -415,9 +431,20 @@ export class McpService {
               dynamic_inputs: t.dynamicInputs,
             });
           }
+          case 'hub_read':
           case 'hub_execute': {
             if (b.server.mode !== 'router') break;
-            return await run(String(args.tool), args.arguments ?? {});
+            // Policies upstream (e.g. Paperclip) match the slug as a string; anything else must not run.
+            if (typeof args.tool !== 'string' || !args.tool) return fail('"tool" must be a tool slug string');
+            if (name === 'hub_read') {
+              const t = bySlug.get(args.tool);
+              if (!t) return fail(`Tool "${args.tool}" is not available on this MCP server`);
+              if (annotationsFor(t).readOnlyHint !== true)
+                return fail(
+                  `Tool "${args.tool}" can change data, so hub_read will not run it; use hub_execute`,
+                );
+            }
+            return await run(args.tool, args.arguments ?? {});
           }
           default: {
             const t = b.server.mode === 'direct' ? byMcpName.get(name) : undefined;
