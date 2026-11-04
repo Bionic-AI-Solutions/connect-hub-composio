@@ -71,10 +71,14 @@ After a hosted connect the browser is redirected to `redirect_url?status=success
 
 MCP endpoint: `POST /mcp` with `Authorization: Bearer chm_…` (streamable HTTP, stateless). Hub tools on every
 server: `hub_list_connections`, `hub_connect`, `hub_list_options`; router mode adds `hub_search_tools`,
-`hub_get_tool_schema`, `hub_execute`.
+`hub_get_tool_schema` and three run tools, each limited to one risk class so a client can govern by tool name:
+`hub_read` (read-only tools only), `hub_execute` (writes; refuses destructive tools) and
+`hub_execute_destructive` (destructive tools only, including raw API calls).
 
 Every tool carries MCP annotations (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`,
-`openWorldHint`) inferred from the action name (see `src/catalog/annotations.ts`); `GET /v1/tools/:slug` returns
+`openWorldHint`) taken from the piece's own READ/SEARCH/WRITE/DESTRUCTIVE label when it has one, otherwise
+inferred from the action name; a destructive verb or a raw API call always counts as destructive (see
+`src/catalog/annotations.ts`); `GET /v1/tools/:slug` returns
 them too.
 
 `connect_handoff` controls what happens when the bound user has not connected the app: `text` (default) returns

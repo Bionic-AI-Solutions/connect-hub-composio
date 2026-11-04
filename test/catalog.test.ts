@@ -86,4 +86,23 @@ describe('catalog', () => {
     });
     expect(a('create_issue')).toMatchObject({ readOnlyHint: false, destructiveHint: false });
   });
+
+  it("uses the piece's own READ/SEARCH/WRITE/DESTRUCTIVE label, but a destructive verb or raw call still wins", () => {
+    const a = (action: string, classification: any) =>
+      inferAnnotations({ action, displayName: action, toolkit: 'reddit', classification });
+    // Contains "post", which the name rules treat as a write; the piece says SEARCH.
+    expect(a('retrieveRedditPost', 'SEARCH')).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    expect(a('fetchPostComments', 'SEARCH')).toMatchObject({ readOnlyHint: true });
+    expect(a('lockIssue', 'WRITE')).toMatchObject({ destructiveHint: true });
+    expect(a('slack_leave_channel', 'WRITE')).toMatchObject({ destructiveHint: true });
+    expect(a('get_thing', 'DESTRUCTIVE')).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(a('list_things', 'WRITE')).toMatchObject({ readOnlyHint: false, destructiveHint: false });
+    expect(a('apify_scrape_url', 'READ')).toMatchObject({ readOnlyHint: false, destructiveHint: false });
+    expect(a('custom_api_call', 'READ')).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+  });
+
+  it('catalog pieces carry their classification through to the tool', () => {
+    const t = registry.getTool('reddit.retrieveRedditPost');
+    expect(t?.classification).toBe('SEARCH');
+  });
 });

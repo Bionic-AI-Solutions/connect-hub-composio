@@ -2,7 +2,8 @@
  * MCP tool annotations. MCP clients such as Paperclip use them to classify risk: readOnlyHint=true → read,
  * destructiveHint=true → destructive (quarantined until an operator approves), otherwise write.
  *
- * Pieces carry no such metadata, so we infer it from the action name. The inference errs towards caution:
+ * Many pieces label each action (READ, SEARCH, WRITE, DESTRUCTIVE); we use that label, and otherwise infer
+ * from the action name. The inference errs towards caution:
  * anything not clearly a read is a write, and generic escape hatches (custom API calls, raw queries) are never
  * marked read-only because they can do anything.
  */
@@ -109,6 +110,8 @@ const WRITE = new Set([
   'comment',
   'react',
 ]);
+/** Start paid work (e.g. an Apify scrape run) even when the piece labels them READ, so never read-only. */
+const STARTS_WORK = new Set(['scrape', 'crawl']);
 /** Generic actions that can perform arbitrary operations. */
 const ESCAPE_HATCH =
   /(custom_api_call|custom_api|raw_graphql|graphql_query|raw_request|run_query|execute_query|sql)/i;
@@ -121,7 +124,9 @@ function words(s: string): string[] {
     .filter(Boolean);
 }
 
-export function inferAnnotations(tool: Pick<ToolDef, 'action' | 'displayName' | 'toolkit'>): ToolAnnotations {
+export function inferAnnotations(
+  tool: Pick<ToolDef, 'action' | 'displayName' | 'toolkit' | 'classification'>,
+): ToolAnnotations {
   const title = tool.displayName;
   if (ESCAPE_HATCH.test(tool.action)) {
     return { title, readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
@@ -130,8 +135,19 @@ export function inferAnnotations(tool: Pick<ToolDef, 'action' | 'displayName' | 
   // Drop a leading toolkit prefix such as "github_create_issue".
   const tk = new Set(words(tool.toolkit));
   const verbs = w.filter((x) => !tk.has(x));
-  if (verbs.some((x) => DESTRUCTIVE.has(x))) {
+  // The piece's own label wins when it says destructive or read; a destructive verb still wins over a
+  // read or write label (caution), so "WRITE leave_channel" stays destructive.
+  if (tool.classification === 'DESTRUCTIVE' || verbs.some((x) => DESTRUCTIVE.has(x))) {
     return { title, readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
+  }
+  if (
+    (tool.classification === 'READ' || tool.classification === 'SEARCH') &&
+    !verbs.some((x) => STARTS_WORK.has(x))
+  ) {
+    return { title, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+  }
+  if (tool.classification === 'WRITE') {
+    return { title, readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
   }
   const first = verbs[0];
   if (first && READ.has(first) && !verbs.some((x) => WRITE.has(x))) {
