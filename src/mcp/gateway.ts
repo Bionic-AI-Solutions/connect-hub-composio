@@ -366,6 +366,12 @@ export class McpService {
       if (res.successful) return ok(res.data ?? { ok: true });
       if (res.error?.code === 'connection_required') {
         const tk = bySlug.get(slug)!.toolkit;
+        // Router mode: only hub_connect creates a connect link, so a client that gates connecting an app
+        // (Paperclip asks the board on hub_connect) cannot be bypassed by calling an unconnected app.
+        if (b.server.mode === 'router')
+          return fail(
+            `${res.error.message}. Call hub_connect with toolkit "${tk}" to connect it, then retry.`,
+          );
         try {
           const link = await this.connections.createConnectLink(b.tenantId, {
             user_id: b.userId,

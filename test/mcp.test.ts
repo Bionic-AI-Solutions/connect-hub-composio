@@ -174,6 +174,24 @@ describe('MCP gateway', () => {
     expect(res.content[0].text).toContain('http://hub.test/connect/');
   });
 
+  it('router mode leaves connecting to hub_connect: other tools make no connect link', async () => {
+    ctx = await setup();
+    const { cl } = await mcpClient(ctx, 'router', 'new-user', 'elicitation');
+    client = cl;
+    for (const [name, tool] of [
+      ['hub_execute', 'fake.echo'],
+      ['hub_read', 'fake.peek'],
+      ['hub_execute_destructive', 'fake.zap'],
+    ]) {
+      const res: any = await cl.callTool({ name, arguments: { tool, arguments: { text: 'x' } } });
+      expect(res.isError, name).toBe(true);
+      expect(res.content[0].text).toContain('Call hub_connect');
+      expect(res.content[0].text).not.toContain('/connect/');
+    }
+    const link = text(await cl.callTool({ name: 'hub_connect', arguments: { toolkit: 'fake' } }));
+    expect(link.connect_url).toContain('http://hub.test/connect/');
+  });
+
   it('annotates tools so clients can classify risk', async () => {
     ctx = await setup();
     const { cl } = await mcpClient(ctx, 'direct');
