@@ -185,6 +185,51 @@ export async function buildApp(
       if (!(await s.tenants.get(req.params.id))) throw new AppError(404, 'not_found', 'Tenant not found');
       return s.oauth.setSsoPolicy(req.params.id, req.body ?? {});
     });
+    // Copy another tenant's OAuth apps and active connected accounts into this one (same people, same apps).
+    admin.post<{
+      Params: { id: string };
+      Body: {
+        source_tenant_id?: string;
+        toolkits?: string[];
+        user_map?: Record<string, string>;
+        dry_run?: boolean;
+      };
+    }>('/admin/tenants/:id/copy-from', async (req) => {
+      const b = req.body ?? {};
+      if (typeof b.source_tenant_id !== 'string' || !b.source_tenant_id)
+        throw badRequest('source_tenant_id is required');
+      if (b.dry_run !== undefined && typeof b.dry_run !== 'boolean')
+        throw badRequest('dry_run must be a boolean');
+      if (
+        b.toolkits !== undefined &&
+        !(
+          Array.isArray(b.toolkits) &&
+          b.toolkits.length > 0 &&
+          b.toolkits.every((t) => typeof t === 'string' && t)
+        )
+      )
+        throw badRequest(
+          'toolkits must be a non-empty array of toolkit slugs (omit it to copy every toolkit)',
+        );
+      if (
+        b.user_map !== undefined &&
+        (typeof b.user_map !== 'object' ||
+          b.user_map === null ||
+          Array.isArray(b.user_map) ||
+          !Object.entries(b.user_map).every(
+            ([k, v]) => k.length > 0 && typeof v === 'string' && v.length > 0,
+          ))
+      )
+        throw badRequest('user_map must map source user_id to target user_id');
+      for (const id of [req.params.id, b.source_tenant_id])
+        if (!(await s.tenants.get(id))) throw new AppError(404, 'not_found', `Tenant ${id} not found`);
+      const report = await s.connections.copyFromTenant(req.params.id, b.source_tenant_id, {
+        toolkits: b.toolkits,
+        userMap: b.user_map,
+        dryRun: b.dry_run === true,
+      });
+      return { dry_run: b.dry_run === true, ...report };
+    });
     admin.post<{ Params: { id: string }; Body: { name?: string } }>(
       '/admin/tenants/:id/api-keys',
       async (req, reply) => {

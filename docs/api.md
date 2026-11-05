@@ -4,11 +4,44 @@ Tenant endpoints take `Authorization: Bearer chk_…` (or `x-api-key`). Errors a
 
 ## Admin (`Authorization: Bearer $ADMIN_TOKEN`)
 
-| Method | Path                          | Body      | Result                               |
-| ------ | ----------------------------- | --------- | ------------------------------------ |
-| POST   | `/admin/tenants`              | `{name}`  | `{tenant, api_key}` (key shown once) |
-| GET    | `/admin/tenants`              |           | `{items}`                            |
-| POST   | `/admin/tenants/:id/api-keys` | `{name?}` | `{id, api_key}`                      |
+| Method | Path                           | Body                                                 | Result                               |
+| ------ | ------------------------------ | ---------------------------------------------------- | ------------------------------------ |
+| POST   | `/admin/tenants`               | `{name}`                                             | `{tenant, api_key}` (key shown once) |
+| GET    | `/admin/tenants`               |                                                      | `{items}`                            |
+| POST   | `/admin/tenants/:id/api-keys`  | `{name?}`                                            | `{id, api_key}`                      |
+| POST   | `/admin/tenants/:id/copy-from` | `{source_tenant_id, toolkits?, user_map?, dry_run?}` | `{dry_run, auth_configs, accounts}`  |
+
+### Copying one tenant's apps and accounts into another
+
+`POST /admin/tenants/:id/copy-from` copies the source tenant's auth configs (OAuth apps) and its `ACTIVE` connected
+accounts into tenant `:id`. Use it when two client companies run on the same underlying app accounts (the same
+person's Gmail, GitHub, …). Each secret is decrypted with the source tenant's key and re-encrypted with the
+target's.
+
+- `toolkits` limits the copy to those slugs. Leave it out to copy every toolkit.
+- `user_map` renames users, for example `{"me@a.com": "me@b.com"}`.
+- `dry_run: true` reports without writing.
+
+An auth config with the same toolkit, scheme and client is not copied again, and neither is an `ACTIVE` account
+with the same user, toolkit and identifier. This applies to rows already in the target and to rows earlier in the
+same run. So the call is safe to repeat, and a run that fails part-way is completed by running it again. Run one
+copy at a time.
+
+The result lists each item as `copied`, `exists`, `would_copy` or `skipped`. It never contains credentials.
+Triggers and per-account action state are not copied. The target's audit log records `account.copied` for each
+account and `tenant.copy` for each run, with the source tenant in `tool` (`from:<tenant>`).
+
+**Refresh tokens.** An OAuth copy (`shares_refresh_token: true` in the result) shares the source account's refresh
+token. Both copies keep working with providers whose refresh tokens can be reused, such as Google. Some providers
+rotate refresh tokens, so each one works only once (Atlassian, for example). With those, the tenant that refreshes
+first keeps the account, and the other tenant's copy, which can be the source's, turns `EXPIRED`. The user then
+reconnects in that tenant. Exclude such toolkits with `toolkits`, or reconnect them in the target instead.
+
+```bash
+HUB_URL=https://connect.example.com ADMIN_TOKEN=… node scripts/hubctl.mjs tenant:copy <from_tenant> <to_tenant> --dry-run
+HUB_URL=https://connect.example.com ADMIN_TOKEN=… node scripts/hubctl.mjs tenant:copy <from_tenant> <to_tenant> \
+  --toolkits=gmail,google-drive --map=me@a.com=me@b.com
+```
 
 ## Catalog
 

@@ -6,6 +6,8 @@
  *   HUB_URL=… HUB_API_KEY=chk_… node scripts/hubctl.mjs server:create github-agents github,gmail [--router] [--elicitation]
  *   HUB_URL=… HUB_API_KEY=chk_… node scripts/hubctl.mjs token:issue <server_id> <user_id>
  *   HUB_URL=… HUB_API_KEY=chk_… node scripts/hubctl.mjs servers | accounts [user_id] | toolkits
+ *   HUB_URL=… ADMIN_TOKEN=… node scripts/hubctl.mjs tenant:copy <from_tenant> <to_tenant> [--dry-run]
+ *       [--toolkits=gmail,github] [--map=old@x.com=new@y.com,…]   copy OAuth apps + active accounts
  *
  * Secrets are printed once to stdout; nothing is written to disk.
  */
@@ -33,6 +35,34 @@ const out = (v) => console.log(JSON.stringify(v, null, 2));
 const commands = {
   'tenant:create': async () => out(await admin('POST', '/admin/tenants', { name: pos[0] ?? 'default' })),
   tenants: async () => out(await admin('GET', '/admin/tenants')),
+  'tenant:copy': async () => {
+    const usage =
+      'usage: tenant:copy <from_tenant> <to_tenant> [--dry-run] [--toolkits=a,b] [--map=from_user=to_user,…]';
+    if (pos.length !== 2) throw new Error(usage);
+    // Strict flags: a mistyped --dry-run must not turn into a real copy.
+    const body = { source_tenant_id: pos[0], dry_run: false };
+    for (const a of args.filter((x) => x.startsWith('--'))) {
+      const [name, value] = [
+        a.slice(0, a.includes('=') ? a.indexOf('=') : a.length),
+        a.slice(a.indexOf('=') + 1),
+      ];
+      if (a === '--dry-run') body.dry_run = true;
+      else if (name === '--toolkits' && a.includes('=') && value.trim()) {
+        body.toolkits = value.split(',').map((t) => t.trim());
+        if (body.toolkits.some((t) => !t)) throw new Error(`empty toolkit in ${a}`);
+      } else if (name === '--map' && a.includes('=') && value.trim()) {
+        // user ids can contain ':' (agent:<id>), so each pair is from=to.
+        body.user_map = Object.fromEntries(
+          value.split(',').map((pair) => {
+            const at = pair.indexOf('=');
+            if (at <= 0 || at === pair.length - 1) throw new Error(`--map pair must be from=to: "${pair}"`);
+            return [pair.slice(0, at).trim(), pair.slice(at + 1).trim()];
+          }),
+        );
+      } else throw new Error(`unknown or incomplete option ${a}\n${usage}`);
+    }
+    out(await admin('POST', `/admin/tenants/${encodeURIComponent(pos[1])}/copy-from`, body));
+  },
   toolkits: async () => {
     const { items } = await api('GET', '/v1/toolkits');
     for (const t of items)

@@ -58,6 +58,11 @@ interface ConnectSecret {
 }
 
 export type PublicAccount = Omit<AccountRow, 'credentials_enc'>;
+/** One row of a tenant copy report: names only, never credentials. */
+export type CopyItem = Record<string, unknown> & {
+  toolkit: string;
+  result: 'copied' | 'exists' | 'would_copy' | 'skipped';
+};
 export type PublicAuthConfig = Omit<AuthConfigRow, 'client_secret_enc'> & { has_client_secret: boolean };
 
 const toIso = (d: Date | string | null) => (d == null ? null : new Date(d).toISOString());
@@ -774,6 +779,158 @@ export class ConnectionService {
 
   async getAccount(tenantId: string, id: string): Promise<PublicAccount> {
     return publicAccount(await this.row(tenantId, id));
+  }
+
+  /**
+   * Operator copy of one tenant's OAuth apps and ACTIVE connected accounts into another tenant, for clients
+   * that use the same underlying app accounts. Secrets are decrypted with the source tenant's key and
+   * re-encrypted with the target's (a raw row copy would not decrypt). Idempotent: an auth config with the
+   * same toolkit, scheme and client, or an ACTIVE account with the same user, toolkit and identifier, already
+   * in the target (or earlier in this run) is reused, not duplicated, so a run that fails part-way is fixed by
+   * running it again. Triggers and per-account state (kv_store) are not copied.
+   * The result names what was copied; it never contains credentials.
+   */
+  async copyFromTenant(
+    targetTenantId: string,
+    sourceTenantId: string,
+    opts: { toolkits?: string[]; userMap?: Record<string, string>; dryRun?: boolean } = {},
+  ): Promise<{ auth_configs: CopyItem[]; accounts: CopyItem[] }> {
+    if (targetTenantId === sourceTenantId) throw badRequest('source and target tenant are the same');
+    const want = (toolkit: string) => !opts.toolkits?.length || opts.toolkits.includes(toolkit);
+    const userMap = opts.userMap ?? {};
+    const mapUser = (u: string) => (Object.hasOwn(userMap, u) ? userMap[u] : u);
+    const authConfigs: CopyItem[] = [];
+    const accounts: CopyItem[] = [];
+
+    // Source config id -> target config id. A key already handled in this run maps to the same target row,
+    // so a dry run reports what a real run would do when two source rows collide.
+    const configMap = new Map<string, string | null>();
+    const configByKey = new Map<string, string | null>();
+    const { rows: srcConfigs } = await this.db.query<AuthConfigRow>(
+      'SELECT * FROM auth_configs WHERE tenant_id = $1 ORDER BY created_at',
+      [sourceTenantId],
+    );
+    for (const c of srcConfigs.filter((r) => want(r.toolkit))) {
+      const item = { toolkit: c.toolkit, scheme: c.scheme, own_app: !c.use_platform_app };
+      const key = JSON.stringify([c.toolkit, c.scheme, c.use_platform_app, c.client_id]);
+      if (configByKey.has(key)) {
+        configMap.set(c.id, configByKey.get(key)!);
+        authConfigs.push({ ...item, result: 'exists' });
+        continue;
+      }
+      const { rows: existing } = await this.db.query<{ id: string }>(
+        `SELECT id FROM auth_configs WHERE tenant_id = $1 AND toolkit = $2 AND scheme = $3
+           AND use_platform_app = $4 AND client_id IS NOT DISTINCT FROM $5 ORDER BY created_at DESC LIMIT 1`,
+        [targetTenantId, c.toolkit, c.scheme, c.use_platform_app, c.client_id],
+      );
+      let targetId: string | null;
+      if (existing[0]) {
+        targetId = existing[0].id;
+        authConfigs.push({ ...item, result: 'exists' });
+      } else if (opts.dryRun) {
+        targetId = null;
+        authConfigs.push({ ...item, result: 'would_copy' });
+      } else {
+        targetId = newId('ac');
+        const secretEnc = c.client_secret_enc
+          ? this.vault.encrypt(
+              this.vault.decrypt<string>(c.client_secret_enc, sourceTenantId),
+              targetTenantId,
+            )
+          : null;
+        await this.db.query(
+          `INSERT INTO auth_configs (id, tenant_id, toolkit, scheme, use_platform_app, client_id, client_secret_enc, scopes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [
+            targetId,
+            targetTenantId,
+            c.toolkit,
+            c.scheme,
+            c.use_platform_app,
+            c.client_id,
+            secretEnc,
+            c.scopes ? JSON.stringify(c.scopes) : null,
+          ],
+        );
+        authConfigs.push({ ...item, result: 'copied' });
+      }
+      configByKey.set(key, targetId);
+      configMap.set(c.id, targetId);
+    }
+
+    const seenAccounts = new Set<string>();
+    const { rows: srcAccounts } = await this.db.query<AccountRow>(
+      `SELECT * FROM connected_accounts WHERE tenant_id = $1 AND status = 'ACTIVE' ORDER BY created_at`,
+      [sourceTenantId],
+    );
+    for (const a of srcAccounts.filter((r) => want(r.toolkit))) {
+      const userId = mapUser(a.user_id);
+      const item = {
+        toolkit: a.toolkit,
+        user_id: userId,
+        identifier: a.identifier,
+        // OAuth copies share one refresh token; with a provider that rotates it, only one tenant keeps it.
+        ...(a.scheme === 'OAUTH2' ? { shares_refresh_token: true } : {}),
+      };
+      const key = JSON.stringify([userId, a.toolkit, a.identifier]);
+      if (seenAccounts.has(key)) {
+        accounts.push({ ...item, result: 'exists' });
+        continue;
+      }
+      seenAccounts.add(key);
+      if (!a.credentials_enc) {
+        accounts.push({ ...item, result: 'skipped', reason: 'no stored credentials' });
+        continue;
+      }
+      const { rows: existing } = await this.db.query<{ id: string }>(
+        `SELECT id FROM connected_accounts WHERE tenant_id = $1 AND user_id = $2 AND toolkit = $3
+           AND status = 'ACTIVE' AND identifier IS NOT DISTINCT FROM $4 LIMIT 1`,
+        [targetTenantId, userId, a.toolkit, a.identifier],
+      );
+      if (existing[0]) {
+        accounts.push({ ...item, result: 'exists' });
+        continue;
+      }
+      if (opts.dryRun) {
+        accounts.push({ ...item, result: 'would_copy' });
+        continue;
+      }
+      const value = this.vault.decrypt<ConnectionValue>(a.credentials_enc, sourceTenantId);
+      const id = newId('ca');
+      await this.db.query(
+        `INSERT INTO connected_accounts (id, tenant_id, user_id, toolkit, scheme, auth_config_id, status, credentials_enc, identifier, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,'ACTIVE',$7,$8,$9)`,
+        [
+          id,
+          targetTenantId,
+          userId,
+          a.toolkit,
+          a.scheme,
+          a.auth_config_id ? (configMap.get(a.auth_config_id) ?? null) : null,
+          this.vault.encrypt(value, targetTenantId),
+          a.identifier,
+          a.expires_at,
+        ],
+      );
+      await this.db.query(
+        `INSERT INTO audit_log (tenant_id, user_id, action, toolkit, tool, connected_account_id, status)
+         VALUES ($1,$2,'account.copied',$3,$4,$5,'ok')`,
+        [targetTenantId, userId, a.toolkit, `from:${sourceTenantId}`, id],
+      );
+      accounts.push({ ...item, result: 'copied' });
+    }
+    if (!opts.dryRun) {
+      const count = (xs: CopyItem[]) => xs.filter((x) => x.result === 'copied').length;
+      await this.db.query(
+        `INSERT INTO audit_log (tenant_id, action, tool, status, error) VALUES ($1,'tenant.copy',$2,'ok',$3)`,
+        [
+          targetTenantId,
+          `from:${sourceTenantId}`,
+          `copied ${count(authConfigs)} auth configs, ${count(accounts)} accounts`,
+        ],
+      );
+    }
+    return { auth_configs: authConfigs, accounts };
   }
 
   async deleteAccount(tenantId: string, id: string): Promise<void> {
